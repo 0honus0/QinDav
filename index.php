@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.3.0';
+const QINDAV_VERSION = '1.4.0';
 try { $applicationLock = applicationGate(); } catch (Throwable $error) {
     error_log('QinDav bootstrap: ' . $error->getMessage());
     http_response_code(503);
@@ -909,12 +909,40 @@ function updateRemove(string $path): void
     if (!rmdir($path)) throw new RuntimeException('Cannot remove update directory');
 }
 
-function updateInvalidate(): void
+// The package determines its application files; runtime state stays outside the web root.
+function updateEntries(string $root): array
+{
+    $names = [];
+    foreach (new FilesystemIterator($root, FilesystemIterator::SKIP_DOTS) as $entry) {
+        $name = $entry->getFilename();
+        if ($entry->isLink() || preg_match('/[\\x00-\\x1f\\x7f\\\\]/', $name)) throw new InvalidArgumentException('程序包路径无效');
+        $names[] = $name;
+    }
+    sort($names, SORT_STRING);
+    // Publish/recover the bootstrap last, after its supporting files.
+    return array_merge(array_values(array_diff($names, ['index.php'])), in_array('index.php', $names, true) ? ['index.php'] : []);
+}
+
+function updateManagedEntries(): array
+{
+    $names = readJson(stateDir() . '/update-managed.json')['entries'] ?? ['vendor', 'index.php'];
+    if (file_exists(__DIR__ . '/dav.php')) $names[] = 'dav.php';
+    foreach ($names as $name) {
+        if (!is_string($name) || $name === '' || $name === '.' || $name === '..' || preg_match('/[\\x00-\\x1f\\x7f\\\\\/]/', $name)) {
+            throw new RuntimeException('Invalid managed application path');
+        }
+    }
+    return array_values(array_unique($names));
+}
+
+function updateInvalidate(array $entries = []): void
 {
     if (!function_exists('opcache_invalidate')) return;
-    foreach (['index.php', 'dav.php'] as $name) @opcache_invalidate(__DIR__ . '/' . $name, true);
-    if (is_dir(__DIR__ . '/vendor')) {
-        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator(__DIR__ . '/vendor', FilesystemIterator::SKIP_DOTS));
+    foreach (array_unique(array_merge(updateManagedEntries(), $entries)) as $name) {
+        $path = __DIR__ . '/' . $name;
+        if (is_file($path)) { @opcache_invalidate($path, true); continue; }
+        if (!is_dir($path) || is_link($path)) continue;
+        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
         foreach ($iterator as $entry) if ($entry->isFile() && !$entry->isLink() && $entry->getExtension() === 'php') @opcache_invalidate($entry->getPathname(), true);
     }
 }
@@ -930,17 +958,17 @@ function updateRecover(): bool
     if (($journal['committed'] ?? false) === true) {
         updateRecordBackup($journal);
     } else {
-        foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+        foreach ($journal['entries'] ?? ['vendor', 'dav.php', 'index.php'] as $name) {
             $backup = $job . '/old/' . $name;
             $live = __DIR__ . '/' . $name;
             if (file_exists($backup)) {
-                if (is_dir($backup)) updateRemove($live);
+                if (is_dir($backup) || is_dir($live)) updateRemove($live);
                 if (!rename($backup, $live)) throw new RuntimeException('Cannot restore previous application');
             } elseif (($journal['existed'][$name] ?? true) === false && !file_exists($job . '/new/' . $name)) {
                 updateRemove($live);
             }
         }
-        updateInvalidate();
+        updateInvalidate($journal['entries'] ?? []);
     }
     if (!unlink($journalPath)) throw new RuntimeException('Cannot clear update journal');
     if (!in_array($journal['job'], array_column(updateBackups()['backups'], 'id'), true)) updateRemove($job);
@@ -979,7 +1007,7 @@ function updateCapabilities(): array
         $errors[] = '主机禁止清除 PHP 程序缓存，无法安全自动替换';
     }
     if (!is_writable(__DIR__)) $errors[] = 'PHP 没有应用目录写入权限';
-    foreach (['index.php', 'dav.php', 'vendor'] as $name) {
+    foreach (updateManagedEntries() as $name) {
         $path = __DIR__ . '/' . $name;
         if (is_link($path)) $errors[] = '应用入口与依赖不能使用符号链接';
         if (file_exists($path) && !is_writable($path)) $errors[] = $name . ' 不可写';
@@ -1081,8 +1109,7 @@ function updateExtract(string $archive, string $destination, string $version): v
             $name = $stat['name'];
             $parts = explode('/', rtrim($name, '/'));
             if (isset($seen[$name]) || preg_match('/[\x00-\x1f\x7f\\\\]/', $name) || in_array('', $parts, true)
-                || in_array('..', $parts, true) || in_array('.', $parts, true)
-                || !($name === 'index.php' || str_starts_with($name, 'vendor/'))) {
+                || in_array('..', $parts, true) || in_array('.', $parts, true)) {
                 throw new InvalidArgumentException('更新包包含非法路径');
             }
             $seen[$name] = true;
@@ -1094,7 +1121,7 @@ function updateExtract(string $archive, string $destination, string $version): v
             $total += $stat['size'];
             if ($total > 64 * 1024 * 1024) throw new InvalidArgumentException('更新包解压大小超限');
         }
-        foreach (['index.php', 'vendor/autoload.php', 'vendor/composer/autoload_real.php'] as $required) {
+        foreach (['index.php'] as $required) {
             if (!isset($seen[$required])) throw new InvalidArgumentException('更新包缺少必要程序文件');
         }
         $source = $zip->getFromName('index.php');
@@ -1135,15 +1162,15 @@ function updateSaveBackups(array $data): void
     }
 }
 
-function updateSnapshotHash(string $root): string
+function updateSnapshotHash(string $root, ?array $names = null): string
 {
+    if (!is_file($root . '/index.php') || is_link($root . '/index.php')) throw new InvalidArgumentException('程序快照缺少有效入口');
     $files = [];
-    foreach (['index.php', 'dav.php', 'vendor'] as $name) {
+    foreach ($names ?? ($root === __DIR__ ? updateManagedEntries() : updateEntries($root)) as $name) {
         $path = $root . '/' . $name;
         if (is_link($path)) throw new InvalidArgumentException('程序快照包含符号链接');
         if (is_file($path)) { $files[$name] = $path; continue; }
-        // Legacy backups may contain the former DAV entry; include it only when present.
-        if ($name === 'dav.php' && !file_exists($path)) continue;
+        if (!file_exists($path)) continue;
         if (!is_dir($path)) throw new InvalidArgumentException('程序快照缺少必要文件');
         $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
         foreach ($iterator as $entry) {
@@ -1162,6 +1189,7 @@ function updateSnapshotHash(string $root): string
 
 function updateRecordBackup(array $journal): void
 {
+    if (isset($journal['new_entries'])) atomicJson(stateDir() . '/update-managed.json', ['entries' => $journal['new_entries']]);
     $data = updateBackups(); $existing = null;
     foreach ($data['backups'] as $backup) {
         if (($backup['fingerprint'] ?? '') === $journal['fingerprint']) { $existing = $backup; break; }
@@ -1205,14 +1233,18 @@ function updatePublish(string $jobName, string $sessionEpoch, string $version): 
     $current = config();
     if (!hash_equals($current['session_epoch'], $sessionEpoch)) throw new DAV\Exception\Forbidden('Session expired');
     $journal = ['job' => $jobName, 'committed' => false, 'existed' => [], 'previous_version' => QINDAV_VERSION,
-        'created_at' => time(), 'fingerprint' => updateSnapshotHash(__DIR__)];
-    foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+        'created_at' => time(), 'new_entries' => updateEntries($job . '/new')];
+    $entries = array_unique(array_merge(updateManagedEntries(), $journal['new_entries']));
+    $journal['entries'] = array_merge(array_values(array_diff($entries, ['index.php'])), ['index.php']);
+    $journal['fingerprint'] = updateSnapshotHash(__DIR__, $journal['entries']);
+    foreach ($journal['entries'] as $name) {
         $journal['existed'][$name] = file_exists(__DIR__ . '/' . $name);
         if (is_link(__DIR__ . '/' . $name)) throw new InvalidArgumentException('应用文件变成了符号链接，请重新检查');
     }
     atomicJson(stateDir() . '/update-journal.json', $journal);
     try {
-        foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+        updateInvalidate($journal['entries']);
+        foreach ($journal['entries'] as $name) {
             $live = __DIR__ . '/' . $name;
             if ($journal['existed'][$name]) {
                 $backup = $job . '/old/' . $name;
@@ -1223,13 +1255,14 @@ function updatePublish(string $jobName, string $sessionEpoch, string $version): 
                     if (!copy($live, $backup . '.tmp') || !rename($backup . '.tmp', $backup)) throw new RuntimeException('Cannot back up ' . $name);
                 }
             }
-            if ($name === 'dav.php' && !file_exists($job . '/new/' . $name)) {
-                updateRemove($live); // Remove the former entry when publishing a single-entry snapshot.
+            if (!file_exists($job . '/new/' . $name)) {
+                updateRemove($live); // Files removed from the package disappear from the active application.
                 continue;
             }
+            if (is_dir($live)) updateRemove($live);
             if (!rename($job . '/new/' . $name, $live)) throw new RuntimeException('Cannot publish ' . $name);
         }
-        updateInvalidate();
+        updateInvalidate($journal['entries']);
         $journal['committed'] = true;
         atomicJson(stateDir() . '/update-journal.json', $journal);
     } catch (Throwable $error) {
@@ -1300,9 +1333,8 @@ function restoreUpdate(string $backupId, string $sessionEpoch): array
         if (($backup['fingerprint'] ?? '') === updateSnapshotHash(__DIR__)) throw new DAV\Exception\Conflict('当前程序与此备份完全相同，无需回退');
         if (($backup['fingerprint'] ?? '') !== updateSnapshotHash(stateDir() . '/updates/' . $backupId . '/old')) throw new InvalidArgumentException('备份内容校验失败，不能回退');
         if (!mkdir($job . '/new', 0700, true) || !mkdir($job . '/old', 0700)) throw new RuntimeException('Cannot prepare restore');
-        foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+        foreach (updateEntries(stateDir() . '/updates/' . $backupId . '/old') as $name) {
             $source = stateDir() . '/updates/' . $backupId . '/old/' . $name;
-            if ($name === 'dav.php' && !file_exists($source)) continue;
             updateCopy($source, $job . '/new/' . $name);
         }
         return updatePublish($jobName, $sessionEpoch, $backup['version']);
@@ -1524,6 +1556,7 @@ try {
 body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;height:100%;padding:0 24px;display:flex;flex-direction:column}.app header{height:52px;flex-shrink:0}.app .brand{font-size:19px}.app .brand small{font-size:11px}.app .file-browser{display:flex;flex:1;flex-direction:column;min-height:0}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.app .browser-bar{padding:10px 0;gap:20px;border-top:0;flex-shrink:0}.app .crumb{flex:1;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;scrollbar-width:thin;min-height:30px;align-items:center}.app .crumb button{flex-shrink:0}.browser-tools{display:flex;align-items:center;gap:12px;min-width:0}.app .filter{width:180px}.app .browser-tools .tools{flex-wrap:nowrap}.app #status{flex-shrink:0;max-height:72px;overflow:auto}.app #status:not(:empty){padding:8px 0}.app progress{flex-shrink:0}.app .table-wrap{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.app table{table-layout:fixed}.app thead{position:sticky;top:0;z-index:1;background:#fff}.app th{height:36px;background:#fff;box-shadow:0 1px 0 var(--line)}.app th:nth-child(2){width:110px}.app th.modified{width:180px}.app th.actions{width:84px}.app td{height:40px;padding:6px 12px}.app td:first-child{width:auto;min-width:0}.app .name{max-width:100%;min-width:0;gap:10px}.app .filename{min-width:0;max-width:none}.app .file-icon{width:22px;height:24px}.app .row-actions button{min-width:30px;min-height:30px;padding:6px}.app .pager{flex-shrink:0;padding:7px 0;border-top:1px solid var(--line);min-height:42px;gap:12px}.app .pager>div{display:flex;flex-shrink:0}.app .pager .info{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.app footer{display:none}.loading-cell{text-align:center;color:var(--muted);height:120px!important}.app .table-wrap[aria-busy=true] tbody{opacity:.65}
 @media(min-width:1600px){.app main{padding:0 40px}}
 @media(max-width:700px){.app main{padding:0 12px}.app header{height:48px}.app .browser-bar{flex-direction:column;align-items:stretch;padding:6px 0 8px;gap:6px}.app .crumb{flex:none;width:100%;min-height:28px}.browser-tools{gap:6px;width:100%}.app .filter{width:auto;flex:1;min-width:80px}.app .filter input{font-size:12px;padding-right:6px}.app .browser-tools .tools{gap:4px;flex-shrink:0}.app .browser-tools button{padding:6px 7px;font-size:12px}.app th:nth-child(2){width:68px}.app th.actions{width:76px}.app td{padding:6px 5px;height:44px}.app .name{gap:7px;font-size:12px}.app .row-actions button{min-width:34px;min-height:34px;padding:7px}.app .pager{gap:5px;min-height:40px}.app .pager button{padding:6px;font-size:11px}.app .pager .info{font-size:11px}.app .file-icon{width:20px;height:23px}}
+.upload-panel{flex-shrink:0;border:1px solid #dce8f0;border-radius:10px;background:#f7fbfe;padding:12px 16px;margin-bottom:10px}.upload-summary,.upload-detail{display:flex;justify-content:space-between;gap:16px}.upload-summary{font-size:13px}.upload-summary strong{font-weight:500}.upload-summary-actions{display:flex;align-items:center;gap:12px}#upload-close{padding:0;border:0;line-height:1;font-size:19px}#upload-close[hidden]{display:none}.upload-detail{font-size:12px;color:#748593}.upload-panel progress{display:block;width:100%;height:6px;border:0;border-radius:8px;overflow:hidden;accent-color:var(--accent);margin:9px 0;background:#e4edf3}.upload-panel progress::-webkit-progress-bar{background:#e4edf3}.upload-panel progress::-webkit-progress-value{background:var(--accent);border-radius:8px;transition:width .15s}.upload-panel progress::-moz-progress-bar{background:var(--accent)}#upload-current{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.action-dialog{border:1px solid #e5ebf0;border-radius:16px;width:min(420px,calc(100vw - 32px));padding:26px;box-shadow:0 22px 80px #23384930;color:var(--ink)}.action-dialog::backdrop{background:#28374655;backdrop-filter:blur(3px)}.action-dialog h2{font-size:19px;margin:14px 0 8px}.action-dialog p{color:#73808b;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 20px}.action-dialog input{width:100%}.action-symbol{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:#eaf4fc;color:var(--accent);font-size:22px}.action-dialog.danger .action-symbol{color:#c05c5c;background:#fcEEEE}.action-dialog.danger #action-submit{background:#be5d5d;border-color:#be5d5d}.action-controls{display:flex;justify-content:flex-end;gap:8px;margin-top:22px}.action-dialog label[hidden],.upload-panel[hidden]{display:none}@media(max-width:700px){.app .browser-tools .tools{flex-wrap:wrap;flex-shrink:1;min-width:0;justify-content:flex-end}.upload-panel{padding:10px 12px}.upload-detail{gap:8px;flex-wrap:wrap}}
 </style>
 <body<?= $loggedIn ? ' class="app"' : '' ?>>
 <main>
@@ -1534,12 +1567,13 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
 <form method="post"><input type="hidden" name="csrf" value="<?= html($csrfToken) ?>"><input type="hidden" name="action" value="<?= $cfg ? 'login' : 'setup' ?>"><label class="label" for="username">用户名</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label class="label" for="password">密码<?= $cfg ? '' : ' · 至少 12 字节' ?></label><input id="password" name="password" type="password" autocomplete="<?= $cfg ? 'current-password' : 'new-password' ?>" maxlength="72" required><?php if (!$cfg): ?><label class="label" for="confirm">确认密码</label><input id="confirm" name="confirm" type="password" autocomplete="new-password" required><?php if (getenv('WEBDAV_SETUP_TOKEN')): ?><label class="label" for="setup_token">初始化令牌</label><input id="setup_token" name="setup_token" type="password" required><?php endif ?><?php endif ?><button class="primary"><?= $cfg ? '登录' : '创建账号' ?></button></form></section>
 <?php else: ?>
 <section class="file-browser" aria-label="文件浏览">
-<h1 class="sr-only">文件</h1><div class="browser-bar"><nav class="crumb" id="breadcrumb" aria-label="当前路径"></nav><div class="browser-tools"><label class="filter"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="filter" type="search" placeholder="筛选当前页" aria-label="筛选当前页文件"></label><div class="tools"><button class="primary" id="upload-button">上传文件</button><button id="mkdir">新建文件夹</button><button class="quiet" id="refresh" title="刷新文件列表">刷新</button><input type="file" id="files" multiple hidden></div></div></div>
-<div class="status" id="status" role="status" aria-live="polite"></div><progress id="progress" value="0" max="1" hidden></progress>
+<h1 class="sr-only">文件</h1><div class="browser-bar"><nav class="crumb" id="breadcrumb" aria-label="当前路径"></nav><div class="browser-tools"><label class="filter"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="filter" type="search" placeholder="筛选当前页" aria-label="筛选当前页文件"></label><div class="tools"><button class="primary" id="upload-button">上传文件</button><button id="upload-folder">上传文件夹</button><button id="mkdir">新建文件夹</button><button class="quiet" id="refresh" title="刷新文件列表">刷新</button><input type="file" id="files" multiple hidden><input type="file" id="folders" webkitdirectory multiple hidden></div></div></div>
+<div class="status" id="status" role="status" aria-live="polite"></div><section id="upload-panel" class="upload-panel" hidden aria-label="上传进度"><div class="upload-summary"><strong id="upload-title">准备上传</strong><div class="upload-summary-actions"><span id="upload-percent">0%</span><button id="upload-close" class="quiet" type="button" aria-label="关闭上传进度" hidden>×</button></div></div><progress id="progress" value="0" max="1" aria-label="上传总进度"></progress><div class="upload-detail"><span id="upload-details"></span><span id="upload-speed"></span></div><div id="upload-current" class="info"></div></section>
 <div class="table-wrap" id="file-list" aria-busy="true"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="loading-cell">正在读取文件…</td></tr></tbody></table></div>
 <div class="pager"><span class="info" id="capacity"></span><div><button id="prev">上一页</button><button id="next">下一页</button></div></div>
 </section>
 <dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
+<dialog id="action-dialog" class="action-dialog" aria-labelledby="action-title" aria-describedby="action-message"><form id="action-form"><div class="action-symbol" id="action-symbol" aria-hidden="true">!</div><h2 id="action-title"></h2><p id="action-message"></p><label id="action-input-label" hidden><span class="label" id="action-label"></span><input id="action-input" autocomplete="off" spellcheck="false"></label><div class="action-controls"><button type="button" id="action-cancel">取消</button><button type="submit" id="action-submit" class="primary">确认</button></div></form></dialog>
 <script nonce="<?= html($nonce) ?>">
 'use strict';
 const csrf = <?= json_encode($csrfToken) ?>, dav = <?= json_encode($davBase, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
@@ -1553,6 +1587,12 @@ $('endpoint').textContent = endpoint;
 function url(p) { return dav + p.split('/').filter(Boolean).map(encodeURIComponent).join('/'); }
 function size(n) { if(n == null) return '—'; const units=['B','KiB','MiB','GiB','TiB']; let i=0; while(n>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${units[i]}`; }
 function status(message) { $('status').textContent = message; }
+let actionPending=false;
+function ask({title='确认操作',message='',value=null,label='',confirm='确认',danger=false}={}){
+ if(actionPending)return Promise.resolve(null);actionPending=true;
+ const dialog=$('action-dialog'),input=$('action-input');$('action-title').textContent=title;$('action-message').textContent=message;$('action-label').textContent=label;$('action-input-label').hidden=value===null;input.value=value??'';input.required=value!==null;$('action-submit').textContent=confirm;dialog.classList.toggle('danger',danger);$('action-symbol').textContent=danger?'!':value===null?'✓':'+';
+ return new Promise(resolve=>{let settled=false;const finish=result=>{if(settled)return;settled=true;actionPending=false;dialog.close();resolve(result);};$('action-form').onsubmit=event=>{event.preventDefault();finish(value===null?true:input.value.trim());};$('action-cancel').onclick=()=>finish(null);dialog.oncancel=event=>{event.preventDefault();finish(null);};dialog.showModal();if(value!==null){input.focus();input.select();}else $('action-cancel').focus();});
+}
 async function request(p, options={}) {
  const response = await fetch(url(p), {...options, headers:{'X-CSRF-Token':csrf,...options.headers}, credentials:'same-origin', redirect:'error'});
  if(!response.ok) { if(response.status===401) throw Error('登录已过期，请刷新页面'); if(response.status===507)throw Error('空间不足：请检查容量上限或磁盘剩余空间'); throw Error(`操作失败（${response.status}），请检查文件名、目录权限或文件锁`); }
@@ -1571,28 +1611,30 @@ async function transfer(work) {
  await new Promise(resolve=>{if(activeTransfers<4){activeTransfers++;resolve();}else transferQueue.push(resolve);});
  try{return await work();}finally{if(transferQueue.length)transferQueue.shift()();else activeTransfers--;}
 }
-async function uploadPart(id, part, blob) {
+function sendUpload(target,blob,headers,onProgress){
+ return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('PUT',target);xhr.withCredentials=true;for(const [key,value] of Object.entries({'X-CSRF-Token':csrf,...headers}))xhr.setRequestHeader(key,value);
+  xhr.upload.onprogress=event=>onProgress(Math.min(blob.size,event.loaded));
+  xhr.onerror=()=>reject(new TypeError('上传连接中断'));xhr.onabort=()=>reject(Error('上传已取消'));
+  xhr.onload=()=>{if(xhr.responseURL!==new URL(target,location.href).href){reject(Error('上传请求被重定向，请检查主机配置'));return;}resolve({status:xhr.status,ok:xhr.status>=200&&xhr.status<300,text:xhr.responseText});};xhr.send(blob);
+ });
+}
+async function uploadPart(id,part,blob,onProgress){
  for(let attempt=0;;attempt++){
   try{
-   const response=await fetch(`/?api=upload-part&id=${encodeURIComponent(id)}&part=${part}`,{method:'PUT',body:blob,credentials:'same-origin',redirect:'error',headers:{'X-CSRF-Token':csrf}});
-   const result=await response.json();
+   onProgress(0);const response=await sendUpload(`/?api=upload-part&id=${encodeURIComponent(id)}&part=${part}`,blob,{},onProgress);
+   let result;try{result=JSON.parse(response.text);}catch{const error=Error('上传响应无效，请检查主机防护');error.retryable=response.status>=500;throw error;}
    if(!response.ok){const error=Error(result.error||`上传失败（${response.status}）`);error.retryable=[408,429,500,502,503,504].includes(response.status);throw error;}
-   if(result.ok!==true)throw Error('上传响应无效，请检查主机防护');
-   return;
-  }catch(error){
-   if(attempt>=2||(!(error instanceof TypeError)&&!error.retryable))throw error;
-   await new Promise(resolve=>setTimeout(resolve,500*2**attempt));
-  }
+   if(result.ok!==true)throw Error('上传响应无效，请检查主机防护');onProgress(blob.size);return;
+  }catch(error){if(attempt>=2||(!(error instanceof TypeError)&&!error.retryable))throw error;onProgress(0);await new Promise(resolve=>setTimeout(resolve,500*2**attempt));}
  }
 }
-async function uploadFile(file, destination, advance) {
- if(file.size<32*1024*1024){await transfer(()=>request(destination,{method:'PUT',body:file,headers:{'If-None-Match':'*'}}));advance(file.size);return;}
- const job=await api('upload-start',{path:destination,size:file.size});let next=0,failure=null;
+async function uploadFile(file,destination,onProgress){
+ if(file.size<32*1024*1024){await transfer(async()=>{const response=await sendUpload(url(destination),file,{'If-None-Match':'*'},onProgress);if(!response.ok)throw Error(response.status===507?'空间不足：请检查容量上限或磁盘剩余空间':response.status===412?'同名文件已存在，已保留原文件':`上传失败（${response.status}）`);onProgress(file.size);});return;}
+ const job=await api('upload-start',{path:destination,size:file.size});let next=0,failure=null;const loaded=new Map();let sent=0;
+ function progress(part,n){sent+=n-(loaded.get(part)||0);loaded.set(part,n);onProgress(sent);}
  try{
-  async function worker(){while(!failure&&next<job.chunks){const part=next++,start=part*job.chunk_size,blob=file.slice(start,Math.min(file.size,start+job.chunk_size));try{await transfer(()=>uploadPart(job.id,part,blob));advance(blob.size);}catch(error){failure=error;}}}
-  await Promise.all(Array.from({length:Math.min(4,job.chunks)},worker));
-  if(failure)throw failure;
-  await api('upload-finish',{id:job.id});
+  async function worker(){while(!failure&&next<job.chunks){const part=next++,start=part*job.chunk_size,blob=file.slice(start,Math.min(file.size,start+job.chunk_size));try{await transfer(()=>uploadPart(job.id,part,blob,n=>progress(part,n)));}catch(error){failure=error;}}}
+  await Promise.all(Array.from({length:Math.min(4,job.chunks)},worker));if(failure)throw failure;await api('upload-finish',{id:job.id});
  }catch(error){await api('upload-cancel',{id:job.id}).catch(()=>{});throw error;}
 }
 function button(label, fn, className='') { const b=document.createElement('button');b.textContent=label;b.className=className;b.onclick=()=>Promise.resolve().then(fn).catch(e=>status(e.message));return b; }
@@ -1616,7 +1658,7 @@ function renderItems(){
   const p=(path?path+'/':'')+item.name,row=document.createElement('tr'),name=document.createElement('td'),bytes=document.createElement('td'),date=document.createElement('td'),actions=document.createElement('td');
   const filename=button('',()=>item.directory?navigate(p):location.assign(url(p)),`name ${item.directory?'dir':''}`),label=document.createElement('span');label.className='filename';label.textContent=item.name;filename.title=item.name;filename.append(fileIcon(item),label);name.append(filename);
   bytes.textContent=item.directory?'—':size(item.size);date.textContent=dateFormatter.format(new Date(item.modified*1000));date.className='modified';actions.className='actions';const tools=document.createElement('div');tools.className='row-actions';
-  tools.append(actionButton('移动 / 重命名',async()=>{const destination=prompt('目标路径（从根目录开始，不加开头的 /）',p);if(destination===null||destination===p)return;if(!destination||destination.split('/').some(n=>!n||n==='.'||n==='..'))throw Error('请输入有效目标路径');await request(p,{method:'MOVE',headers:{Destination:new URL(url(destination),location.origin).href,Overwrite:'F'}});status('移动完成');await load();},'rename'),actionButton('删除',async()=>{if(!confirm(`删除“${item.name}”${item.directory?'及其全部内容':''}？`))return;await request(p,{method:'DELETE'});status('已删除');await load();},'delete','delete'));
+  tools.append(actionButton('移动 / 重命名',async()=>{const destination=await ask({title:'移动 / 重命名',message:'目标路径从根目录开始，不加开头的 /。',label:'目标路径',value:p,confirm:'保存'});if(destination===null||destination===p)return;if(!destination||destination.split('/').some(n=>!n||n==='.'||n==='..'))throw Error('请输入有效目标路径');await request(p,{method:'MOVE',headers:{Destination:new URL(url(destination),location.origin).href,Overwrite:'F'}});status('移动完成');await load();},'rename'),actionButton('删除',async()=>{if(!await ask({title:item.directory?'删除文件夹':'删除文件',message:`“${item.name}”${item.directory?'及其全部内容':''}将被永久删除。此操作无法撤销。`,confirm:'删除',danger:true}))return;await request(p,{method:'DELETE'});status('已删除');await load();},'delete','delete'));
   actions.append(tools);row.append(name,bytes,date,actions);fragment.append(row);
  }
  if(!items.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;cell.className='empty';cell.textContent=query?'没有匹配的文件':offset?'本页没有文件，请返回上一页':'此目录为空，点击右上角上传文件。';row.append(cell);fragment.append(row);}
@@ -1662,34 +1704,44 @@ settings.addEventListener('close',()=>{hideAppPassword();$('app-result').textCon
 settings.addEventListener('click',event=>{const rect=settings.getBoundingClientRect();if(event.target===settings&&(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom))closeSettings();});
 $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText(endpoint);status('连接地址已复制');}catch{status(endpoint);}};
 $('refresh').onclick=()=>load();$('prev').onclick=()=>{if(!loading)load({nextOffset:Math.max(0,offset-200),reloadStorage:false});};$('next').onclick=()=>{if(!loading&&hasMore)load({nextOffset:offset+200,reloadStorage:false});};
-$('mkdir').onclick=async()=>{const name=prompt('文件夹名称');if(!name)return;if(name.includes('/')||name.includes('\\')||name==='.'||name==='..'){status('请输入有效的文件夹名称');return;}try{await request((path?path+'/':'')+name,{method:'MKCOL'});status('文件夹已创建');await load();}catch(e){status(e.message);}};
-$('upload-button').onclick=()=>$('files').click();
-$('files').onchange=async()=>{
- const files=Array.from($('files').files);if(!files.length)return;
- const uploadPath=path,failures=[];let index=0,done=0,bytes=0;const total=files.reduce((n,file)=>n+file.size,0),started=performance.now();
- $('upload-button').disabled=true;$('progress').hidden=false;$('progress').max=Math.max(1,total);$('progress').value=0;
- function advance(n){bytes+=n;$('progress').value=bytes;status(`已传输 ${size(bytes)} / ${size(total)} · ${size(bytes/Math.max(.001,(performance.now()-started)/1000))}/s · 已处理 ${done} / ${files.length} 个文件`);}
- async function worker(){while(index<files.length){const file=files[index++];try{await uploadFile(file,(uploadPath?uploadPath+'/':'')+file.name,advance);}catch(e){failures.push(`${file.name}：${e.message}`);}done++;advance(0);}}
- await Promise.all(Array.from({length:Math.min(4,files.length)},worker));
- $('upload-button').disabled=false;$('files').value='';$('progress').hidden=true;status(failures.length?`成功 ${files.length-failures.length} 个，失败 ${failures.length} 个\n${failures.join('\n')}`:`已上传 ${files.length} 个文件`);await load();
-};
+$('mkdir').onclick=async()=>{const name=await ask({title:'新建文件夹',message:'在当前目录创建一个文件夹。',label:'文件夹名称',value:'',confirm:'创建'});if(!name)return;if(name.includes('/')||name.includes('\\')||name==='.'||name==='..'){status('请输入有效的文件夹名称');return;}try{await request((path?path+'/':'')+name,{method:'MKCOL'});status('文件夹已创建');await load();}catch(e){status(e.message);}};
+$('upload-close').onclick=()=>$('upload-panel').hidden=true;
+$('upload-button').onclick=()=>$('files').click();$('upload-folder').onclick=()=>$('folders').click();
+if(!('webkitdirectory' in $('folders'))){$('upload-folder').disabled=true;$('upload-folder').title='当前浏览器不支持文件夹选择';}
+let uploading=false;
+async function uploadSelection(input,folder=false){
+ const files=Array.from(input.files);if(!files.length||uploading)return;
+ uploading=true;const uploadPath=path,failures=[],loaded=new Map(),activeNames=new Map(),directories=new Map();let index=0,done=0,succeeded=0,sentBytes=0;
+ const total=files.reduce((n,file)=>n+file.size,0),started=performance.now();
+ $('upload-button').disabled=$('upload-folder').disabled=true;$('upload-panel').hidden=false;$('upload-close').hidden=true;$('progress').max=Math.max(1,total);$('progress').value=0;status('');
+ function renderProgress(){const bytes=sentBytes,seconds=Math.max(.001,(performance.now()-started)/1000),percent=total?Math.floor(bytes/total*100):Math.floor(done/files.length*100);
+  $('progress').value=total?bytes:done===files.length?1:0;$('upload-percent').textContent=`${percent}%`;$('upload-title').textContent=done===files.length?(failures.length?'上传结束，部分文件失败':'上传完成'):bytes===total&&total>0?'正在完成保存…':folder?'正在上传文件夹':'正在上传文件';
+  $('upload-details').textContent=`${size(bytes)} / ${size(total)} · 已处理 ${done} / ${files.length} 个文件`;$('upload-speed').textContent=`平均 ${size(bytes/seconds)}/s`;$('upload-current').textContent=Array.from(activeNames.values()).join(' · ')||'正在准备上传…';
+ }
+ renderProgress();const ticker=setInterval(renderProgress,250);
+ async function ensureDirectory(dir){if(!dir||dir===uploadPath)return;if(directories.has(dir))return directories.get(dir);const promise=(async()=>{const parent=dir.split('/').slice(0,-1).join('/');await ensureDirectory(parent);await transfer(async()=>{const response=await fetch(url(dir),{method:'MKCOL',credentials:'same-origin',redirect:'error',headers:{'X-CSRF-Token':csrf}});if(response.ok)return;if(response.status===405){const check=await request(dir,{method:'PROPFIND',headers:{Depth:'0'}});const xml=new DOMParser().parseFromString(await check.text(),'application/xml');if(xml.getElementsByTagNameNS('DAV:','collection').length)return;}throw Error(`创建文件夹失败（${response.status}）`);});})();directories.set(dir,promise);return promise;}
+ async function worker(){while(index<files.length){const id=index++,file=files[id],relative=folder?file.webkitRelativePath:file.name;activeNames.set(id,relative);renderProgress();try{const parts=relative.split('/');if(parts.some(name=>!name||name==='.'||name==='..'||name.includes('\\')))throw Error('文件路径无效');const destination=(uploadPath?uploadPath+'/':'')+relative;if(folder)await ensureDirectory(destination.split('/').slice(0,-1).join('/'));await uploadFile(file,destination,n=>{sentBytes+=n-(loaded.get(id)||0);loaded.set(id,n);renderProgress();});succeeded++;}catch(error){failures.push(`${relative}：${error.message}`);}done++;activeNames.delete(id);renderProgress();}}
+ try{await Promise.all(Array.from({length:Math.min(4,files.length)},worker));}finally{clearInterval(ticker);renderProgress();uploading=false;$('upload-close').hidden=false;$('upload-button').disabled=false;$('upload-folder').disabled=!('webkitdirectory' in $('folders'));input.value='';$('upload-current').textContent=failures.length?failures[0]:'所有文件已保存';status(failures.length?`成功 ${succeeded} 个，失败 ${failures.length} 个\n${failures.join('\n')}`:`已上传 ${files.length} 个文件`);await load();}
+}
+$('files').onchange=()=>uploadSelection($('files'));$('folders').onchange=()=>uploadSelection($('folders'),true);
+window.addEventListener('beforeunload',event=>{if(uploading){event.preventDefault();event.returnValue='';}});
 let appRequest=0;
 function hideAppPassword(){++appRequest;$('app-secret').value='';$('app-secret').hidden=true;$('view-app').textContent='查看应用密码';}
 function showAppPassword(password){$('app-secret').value=password;$('app-secret').hidden=false;$('view-app').textContent='隐藏应用密码';}
 async function readAppPassword(){const result=await api('view-app-password');if(!result.password)throw Error(result.configured?'旧应用密码仅保存了校验值，无法还原；重新生成一次后即可随时查看。':'尚未生成应用密码');return result.password;}
 $('view-app').onclick=async()=>{if(!$('app-secret').hidden){hideAppPassword();return;}const serial=++appRequest;try{const password=await readAppPassword();if(serial===appRequest&&settings.open){showAppPassword(password);$('app-result').textContent='';}}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
 $('copy-app').onclick=async()=>{const serial=++appRequest;try{const password=await readAppPassword();if(serial!==appRequest||!settings.open)return;try{await navigator.clipboard.writeText(password);if(serial===appRequest&&settings.open)$('app-result').textContent='应用密码已复制';}catch{if(serial===appRequest&&settings.open){showAppPassword(password);$('app-secret').select();$('app-result').textContent='请手动复制应用密码';}}}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
-$('app-password').onclick=async()=>{if(!confirm('生成新应用密码后，旧应用密码会立即失效。继续？'))return;hideAppPassword();const serial=appRequest;try{const result=await api('app-password');if(serial===appRequest&&settings.open){showAppPassword(result.password);$('app-result').textContent='应用密码已生成，可随时回来查看';}}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
-$('revoke-app').onclick=async()=>{if(!confirm('撤销应用密码后，使用该密码的客户端将无法连接。继续？'))return;hideAppPassword();const serial=appRequest;try{await api('revoke-app-password');if(serial===appRequest&&settings.open)$('app-result').textContent='应用密码已撤销';}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
+$('app-password').onclick=async()=>{if(!await ask({title:'生成应用密码',message:'生成后，旧应用密码会立即失效。',confirm:'生成'}))return;hideAppPassword();const serial=appRequest;try{const result=await api('app-password');if(serial===appRequest&&settings.open){showAppPassword(result.password);$('app-result').textContent='应用密码已生成，可随时回来查看';}}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
+$('revoke-app').onclick=async()=>{if(!await ask({title:'撤销应用密码',message:'使用该密码的客户端将无法继续连接。',confirm:'撤销',danger:true}))return;hideAppPassword();const serial=appRequest;try{await api('revoke-app-password');if(serial===appRequest&&settings.open)$('app-result').textContent='应用密码已撤销';}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
 function renderBackups(info){$('backup-keep').value=info.keep;const list=$('update-backups');list.replaceChildren();for(const backup of info.backups){const row=document.createElement('div');row.className='storage-actions';const label=document.createElement('span');label.className='info';label.textContent=`${backup.version} · ${new Date(backup.created_at*1000).toLocaleString()}`;const restore=document.createElement('button');restore.type='button';restore.textContent='回退此版本';restore.disabled=updateBusy||!canRestore;restore.onclick=()=>restoreBackup(backup);row.append(label,restore);list.append(row);}if(!info.backups.length){const empty=document.createElement('p');empty.className='info';empty.textContent='暂无程序备份，更新或回退前会自动备份当前版本。';list.append(empty);}}
 let canRestore=false;
 async function loadUpdates(){const info=await api('update-info');canRestore=info.can_update;$('update-current').textContent=info.current;renderBackups(info);if(!info.can_update)$('update-result').textContent=info.requirements.join('；')+'，请使用发布包手动更新';}
 function setUpdateBusy(busy){updateBusy=busy;$('update-check').disabled=busy;$('update-install').disabled=busy||!updateVersion||!canRestore;$('backup-save').disabled=busy;for(const button of $('update-backups').querySelectorAll('button'))button.disabled=busy||!canRestore;}
-async function restoreBackup(backup){if(updateBusy||!confirm(`回退到 ${backup.version}？当前程序会先备份，账号和用户文件保留。请先暂停其他客户端的传输。`))return;setUpdateBusy(true);$('update-result').textContent='正在备份当前程序并回退…';try{await api('update-restore',{id:backup.id});location.reload();}catch(e){$('update-result').textContent=e.message+'；如连接中断，请刷新页面检查当前版本';setUpdateBusy(false);}}
+async function restoreBackup(backup){if(updateBusy||!await ask({title:`回退到 ${backup.version}`,message:'当前程序会先备份，账号和用户文件保留。请先暂停其他客户端的传输。',confirm:'回退'}))return;setUpdateBusy(true);$('update-result').textContent='正在备份当前程序并回退…';try{await api('update-restore',{id:backup.id});location.reload();}catch(e){$('update-result').textContent=e.message+'；如连接中断，请刷新页面检查当前版本';setUpdateBusy(false);}}
 $('backup-form').onsubmit=async event=>{event.preventDefault();if(updateBusy)return;const keep=Number($('backup-keep').value);if(!Number.isInteger(keep)||keep<1||keep>10){$('update-result').textContent='请输入 1–10 的整数';return;}setUpdateBusy(true);try{const info=await api('update-backup-limit',{keep});renderBackups(info);$('update-result').textContent=`已设置保留最近 ${keep} 份备份，超出部分已清理`;}catch(e){$('update-result').textContent=e.message;}finally{setUpdateBusy(false);}};
 let updateVersion=null,updateBusy=false;
 $('update-check').onclick=async()=>{if(updateBusy)return;updateVersion=null;setUpdateBusy(true);$('update-result').textContent='正在检查 GitHub 最新版本…';try{const info=await api('update-check');canRestore=info.can_update;updateVersion=info.available?info.latest:null;$('update-result').textContent=(info.available?`发现新版本 ${info.latest}`:'当前已是最新版本')+(info.can_update?'':`\n${info.requirements.join('；')}，请下载发布包手动更新`);$('update-install').disabled=!info.available||!info.can_update;}catch(e){$('update-result').textContent=e.message;}finally{setUpdateBusy(false);}};
-$('update-install').onclick=async()=>{if(updateBusy||!updateVersion)return;if(!confirm(`更新到 ${updateVersion}？程序文件将替换并备份，账号和用户文件保留。请先暂停其他客户端的传输。`))return;setUpdateBusy(true);$('update-result').textContent='正在下载、校验并安装更新，请保持页面打开…';try{const result=await api('update-install',{version:updateVersion});$('update-result').textContent=`已更新到 ${result.version}，正在刷新页面…`;location.reload();}catch(e){$('update-result').textContent=e.message+'；如连接中断，请刷新页面检查当前版本';setUpdateBusy(false);}};
+$('update-install').onclick=async()=>{if(updateBusy||!updateVersion)return;if(!await ask({title:`更新到 ${updateVersion}`,message:'程序文件将替换并备份，账号和用户文件保留。请先暂停其他客户端的传输。',confirm:'更新'}))return;setUpdateBusy(true);$('update-result').textContent='正在下载、校验并安装更新，请保持页面打开…';try{const result=await api('update-install',{version:updateVersion});$('update-result').textContent=`已更新到 ${result.version}，正在刷新页面…`;location.reload();}catch(e){$('update-result').textContent=e.message+'；如连接中断，请刷新页面检查当前版本';setUpdateBusy(false);}};
 $('password-form').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget;try{await api('password',Object.fromEntries(new FormData(form)));form.reset();$('password-result').textContent='密码已修改，其他网页登录会话已失效';}catch(e){$('password-result').textContent=e.message;}};
 load();
 </script>

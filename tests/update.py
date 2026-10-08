@@ -69,11 +69,12 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
                                   f"const QINDAV_VERSION = '{'9.9.9' if invalid_version else version}';",
                                   data.decode()).encode()
                 z.writestr(name, data)
-            if extra:
-                for name, data in extra.items():
-                    z.writestr(name, data)
+            for name, data in {'assets/app.css': b'body{color:#456}', 'support.php': b'<?php // future supporting file', **(extra or {})}.items():
+                z.writestr(name, data)
         digest = hashlib.sha256((fixtures / 'QinDav.zip').read_bytes()).hexdigest()
         (fixtures / 'SHA256SUMS').write_text(f'{digest}  QinDav.zip\n')
+
+    (app / 'host-owned.txt').write_text('keep unrelated host file')
 
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
@@ -130,10 +131,8 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             fixture('1.2.0', {'../outside.php': b'bad'})
             check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'path traversal rejected')
             check(not (tmp / 'outside.php').exists(), 'no traversal file written')
-            fixture('1.2.0', {'config.json': b'bad'})
-            check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'unexpected root file rejected')
-            fixture('1.2.0', {'dav.php': b'<?php // unwanted second entry'})
-            check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'second PHP entry rejected in new package')
+            fixture('1.2.0', {'/absolute.php': b'bad'})
+            check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'absolute archive path rejected')
             fixture('1.2.0', invalid_version=True)
             check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'archive version mismatch rejected')
             check(c.api('update-info')[1]['current'] == '1.1.0', 'validation failures preserve old code')
@@ -148,22 +147,26 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
                 check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'partial publication failure rolls back')
                 check((app / 'index.php').read_text() == broken and (app / 'vendor/autoload.php').is_file(), 'all old entries restored')
                 check(c.api('update-info')[1]['backups'] == [], 'failed swap not recorded as backup')
+                check(not (app / 'assets').exists() and not (app / 'support.php').exists(), 'failed publication removes newly introduced package files')
                 (app / 'index.php').write_text(before_fault)
             fixture('1.2.0')
             check(c.api('update-install', {'version': '1.3.0'})[0] == 409, 'changed release requires confirmation again')
             check(c.api('update-install', {'version': '1.2.0'})[0] == 200, 'update installed')
             check(not (app / 'dav.php').exists(), 'single-entry update removes legacy entry')
+            check((app / 'assets/app.css').read_bytes() == b'body{color:#456}' and (app / 'support.php').is_file(), 'future package assets and supporting files installed without fixed whitelist')
             info = c.api('update-info')[1]
             check(info['current'] == '1.2.0' and len(info['backups']) == 1 and info['backups'][0]['version'] == '1.1.0',
                   'new code active and previous code backed up')
             a = info['backups'][0]['id']
             check((state / 'config.json').read_bytes() == account, 'account and application secret preserved')
+            check((app / 'host-owned.txt').read_text() == 'keep unrelated host file', 'updater preserves untracked host files')
             check(c.api('storage')[1]['limit_bytes'] == 100, 'quota preserved')
             check(c.dav('GET', 'preserved.txt', password=app_password)[2] == b'keep this data', 'user data and DAV auth preserved')
             check(c.api('update-check')[1]['available'] is False, 'current release not reinstallable')
             check(c.api('update-install', {'version': '1.2.0'})[0] == 409, 'same version update rejected')
             check(c.api('update-restore', {'id': a})[0] == 200, 'rollback installed')
             check((app / 'dav.php').is_file(), 'rollback restores legacy snapshot file')
+            check(not (app / 'assets').exists() and not (app / 'support.php').exists(), 'rollback removes files introduced by newer package')
             info = c.api('update-info')[1]
             check(info['current'] == '1.1.0' and len(info['backups']) == 2, 'rollback backs up newer code')
             b = next(item['id'] for item in info['backups'] if item['version'] == '1.2.0')
@@ -173,6 +176,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
                 info = c.api('update-info')[1]
                 check(info['current'] == expected, 'repeated rollback activates target')
                 check((app / 'dav.php').exists() == (expected == '1.1.0'), 'entry layout matches restored snapshot')
+                check((app / 'assets/app.css').exists() == (expected == '1.2.0'), 'extra package paths restored and removed across repeated rollback')
                 check(set(item['id'] for item in info['backups']) == {a, b}, 'exact backups reused instead of duplicated')
             check(len(list((state / 'updates').glob('job-*'))) == 2, 'no duplicate snapshot directories left behind')
             bad = state / 'updates' / b / 'old' / 'index.php'; old = bad.read_bytes(); bad.write_bytes(b'tampered')

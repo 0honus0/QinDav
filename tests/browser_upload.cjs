@@ -22,6 +22,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  });
  const paths=['big-one.bin','big-two.bin','small.txt'].map(n=>process.env.FIXTURE_DIR+'/'+n);
  await page.locator('#files').setInputFiles(paths);
+ assert.equal(await page.locator('#upload-panel').isVisible(),true);
  await page.waitForFunction(()=>document.querySelector('#status').textContent==='已上传 3 个文件',{},{timeout:60000});
  const hash=p=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
  for(const name of ['big-one.bin','big-two.bin','small.txt'])assert.equal(hash(process.env.FIXTURE_DIR+'/'+name),hash(process.env.STATE_DIR+'/files/'+name));
@@ -34,7 +35,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.locator('#filter').fill('');await page.locator('#sort-size').click();assert.equal(await page.locator('#rows .filename').first().textContent(),'small.txt');
  await page.locator('#settings-button').click();assert.equal(await page.locator('#settings').evaluate(el=>el.open),true);
  assert.equal(await page.locator('#settings').evaluate(el=>el.matches(':modal')),true);
- page.on('dialog',dialog=>dialog.accept());
+ page.on('dialog',dialog=>{errors.push('Unexpected native dialog: '+dialog.type());dialog.dismiss();});
  await page.waitForFunction(()=>document.querySelector('#update-backups').textContent.includes('暂无程序备份'));
  assert.equal(await page.locator('#update-current').textContent(),process.env.APP_VERSION);
  await page.locator('#backup-keep').fill('3');await page.locator('#backup-save').click();
@@ -44,7 +45,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.route('**/?api=update-check',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({current:'1.1.0',latest:available?'1.2.0':'1.1.0',available,can_update:true,requirements:[]})}));
  await page.route('**/?api=update-install',route=>{installedVersion=route.request().postDataJSON().version;return route.fulfill({status:423,contentType:'application/json',body:JSON.stringify({error:'仍有文件传输正在执行，请稍后重试'})});});
  await page.locator('#update-check').click();await page.waitForFunction(()=>!document.querySelector('#update-install').disabled);
- await page.locator('#update-install').click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('仍有文件传输'));
+ await page.locator('#update-install').click();await page.locator('#action-submit').click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('仍有文件传输'));
  assert.equal(installedVersion,'1.2.0');
  available=false;await page.locator('#update-check').click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent==='当前已是最新版本');
  assert.equal(await page.locator('#update-install').isDisabled(),true);
@@ -52,11 +53,11 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.route('**/?api=update-info',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({current:'1.1.0',can_update:true,requirements:[],keep:3,backups:[{id:backupId,version:'1.0.0',created_at:1700000000}]})}));
  await page.route('**/?api=update-restore',route=>{restoredId=route.request().postDataJSON().id;return route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'备份内容校验失败，不能回退'})});});
  await page.getByRole('button',{name:'关闭设置'}).click();await page.locator('#settings-button').click();
- await page.getByRole('button',{name:'回退此版本'}).click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('备份内容校验失败'));
+ await page.getByRole('button',{name:'回退此版本'}).click();await page.locator('#action-submit').click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('备份内容校验失败'));
  assert.equal(restoredId,backupId);
  await page.unroute('**/?api=update-info');
 
- await page.locator('#app-password').click();await page.waitForFunction(()=>document.querySelector('#app-secret').value.length===48);
+ await page.locator('#app-password').click();await page.locator('#action-submit').click();await page.waitForFunction(()=>document.querySelector('#app-secret').value.length===48);
  const appPassword=await page.locator('#app-secret').inputValue();
  await page.locator('#copy-app').click();await page.waitForFunction(()=>document.querySelector('#app-result').textContent==='应用密码已复制');
  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),appPassword);
@@ -66,7 +67,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.getByRole('button',{name:'关闭设置'}).click();assert.equal(await page.locator('#app-secret').inputValue(),'');
  await page.locator('#settings-button').click();await page.locator('#view-app').click();
  await page.waitForFunction(()=>!document.querySelector('#app-secret').hidden);assert.equal(await page.locator('#app-secret').inputValue(),appPassword);
- await page.locator('#revoke-app').click();await page.waitForFunction(()=>document.querySelector('#app-result').textContent==='应用密码已撤销');
+ await page.locator('#revoke-app').click();await page.locator('#action-submit').click();await page.waitForFunction(()=>document.querySelector('#app-result').textContent==='应用密码已撤销');
  assert.equal(await page.locator('#app-secret').inputValue(),'');
  await page.locator('#view-app').click();await page.waitForFunction(()=>document.querySelector('#app-result').textContent==='尚未生成应用密码');
  await page.waitForFunction(()=>document.querySelector('#storage-used').textContent!=='—');
@@ -90,6 +91,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  quota=await (await page.request.get(process.env.BENCH_URL+'/?api=storage')).json();assert.equal(quota.files,9);assert.equal(quota.reserved_bytes,0);
  await page.getByRole('button',{name:'关闭设置'}).click();
 
+ await page.locator('#upload-close').click();
  await page.setViewportSize({width:1280,height:800});
  let listRect=await page.locator('#file-list').boundingBox();assert.ok(listRect.height/800>.78,'file list owns desktop viewport');
  assert.ok(listRect.y<125,'compact desktop toolbar');
@@ -131,6 +133,28 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-mobile.png'});
  assert.equal(await page.locator('#settings').evaluate(el=>el.getBoundingClientRect().left>=0&&el.getBoundingClientRect().right<=innerWidth),true,'settings fit on mobile');
  await page.getByRole('button',{name:'关闭设置'}).click();await page.setViewportSize({width:1280,height:800});await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-desktop.png'});
- console.log(JSON.stringify({browser:'chromium',global_peak_concurrency:peak,chunk_requests:parts,small_direct_uploads:direct,chunk_retry_passed:failedPart,completion_retry_passed:lostFinish,all_hashes_verified:true,existing_file_preserved:true,filter_sort_navigation_settings_passed:true,quota_save_and_rescan_passed:true,update_and_backup_controls_passed:true,list_viewport_pagination_sticky_and_async_usage_passed:true,mobile_overflow:false,page_errors:errors}));
+ // Custom dialog supports cancellation, text input, rename and destructive actions.
+ await page.getByRole('button',{name:'关闭设置'}).click();
+ await page.locator('#mkdir').click();await page.locator('#action-input').fill('UI test folder');await page.locator('#action-submit').click();
+ await page.waitForFunction(()=>document.querySelector('#status').textContent==='文件夹已创建');await page.waitForFunction(()=>Array.from(document.querySelectorAll('#rows .filename')).some(el=>el.textContent==='UI test folder'));
+ const folderRow=page.locator('#rows tr').filter({has:page.locator('.filename').filter({hasText:'UI test folder'})});
+ await folderRow.getByRole('button',{name:'删除',exact:true}).click();assert.equal(await page.locator('#action-dialog').evaluate(el=>el.matches(':modal')),true);await page.screenshot({path:'/tmp/qindav-delete-dialog.png'});await page.locator('#action-cancel').click();assert.equal(fs.existsSync(root+'/UI test folder'),true);
+ await folderRow.getByRole('button',{name:'移动 / 重命名'}).click();await page.locator('#action-input').fill('Renamed folder');await page.locator('#action-submit').click();await page.waitForFunction(()=>document.querySelector('#status').textContent==='移动完成');
+ await page.locator('#rows tr').filter({has:page.locator('.filename').filter({hasText:'Renamed folder'})}).getByRole('button',{name:'删除',exact:true}).click();await page.locator('#action-submit').click();await page.waitForFunction(()=>document.querySelector('#status').textContent==='已删除');assert.equal(fs.existsSync(root+'/Renamed folder'),false);
+ // Upload a selected folder with nested and Unicode paths into the current remote directory.
+ const localFolder=process.env.FIXTURE_DIR+'/Folder upload';fs.mkdirSync(localFolder+'/子目录',{recursive:true});fs.writeFileSync(localFolder+'/a.txt','folder fixture');fs.writeFileSync(localFolder+'/子目录/b.txt','nested fixture');
+ await page.locator('#folders').setInputFiles(localFolder);await page.waitForFunction(()=>document.querySelector('#status').textContent==='已上传 2 个文件');
+ assert.equal(fs.readFileSync(root+'/Folder upload/a.txt','utf8'),'folder fixture');assert.equal(fs.readFileSync(root+'/Folder upload/子目录/b.txt','utf8'),'nested fixture');
+ fs.writeFileSync(localFolder+'/new.txt','merge into existing directory');await page.locator('#folders').setInputFiles(localFolder);await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('失败 2 个'));assert.equal(fs.readFileSync(root+'/Folder upload/new.txt','utf8'),'merge into existing directory');assert.equal(fs.readFileSync(root+'/Folder upload/a.txt','utf8'),'folder fixture');
+ // Real XHR progress under browser network throttling, with interception disabled.
+ await page.unroute('**/*');const cdp=await page.context().newCDPSession(page);await cdp.send('Network.enable');await cdp.send('Network.emulateNetworkConditions',{offline:false,latency:0,downloadThroughput:10*1024*1024,uploadThroughput:1024*1024});
+ const liveProgressFile=process.env.FIXTURE_DIR+'/progress-live.bin';fs.writeFileSync(liveProgressFile,Buffer.alloc(4*1024*1024,71));
+ await page.locator('#files').setInputFiles(liveProgressFile);
+ await page.waitForFunction(()=>{const percent=parseInt(document.querySelector('#upload-percent').textContent);return percent>0&&percent<100;},{},{timeout:15000});assert.ok((await page.locator('#upload-speed').textContent()).startsWith('平均 '));
+ await page.waitForFunction(()=>document.querySelector('#status').textContent==='已上传 1 个文件',{},{timeout:30000});assert.equal(await page.locator('#upload-percent').textContent(),'100%');assert.equal(await page.locator('#upload-title').textContent(),'上传完成');assert.equal(hash(liveProgressFile),hash(root+'/progress-live.bin'));
+ await cdp.send('Network.emulateNetworkConditions',{offline:false,latency:0,downloadThroughput:-1,uploadThroughput:-1});
+ assert.equal(errors.length,0,errors.join('\n'));
+ await page.screenshot({path:'/tmp/qindav-upload-progress.png',fullPage:true});
+ console.log(JSON.stringify({browser:'chromium',global_peak_concurrency:peak,chunk_requests:parts,small_direct_uploads:direct,chunk_retry_passed:failedPart,completion_retry_passed:lostFinish,all_hashes_verified:true,existing_file_preserved:true,filter_sort_navigation_settings_passed:true,quota_save_and_rescan_passed:true,update_and_backup_controls_passed:true,list_viewport_pagination_sticky_and_async_usage_passed:true,custom_dialogs_and_folder_upload_passed:true,live_xhr_progress_passed:true,mobile_overflow:false,page_errors:errors}));
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});
