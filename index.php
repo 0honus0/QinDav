@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.2';
+const QINDAV_VERSION = '1.4.3';
 const PERFORMANCE_LOG_ENABLED = true;
 const PERFORMANCE_LOG_MAX_BYTES = 2 * 1024 * 1024;
 performanceStart();
@@ -107,6 +107,9 @@ function performanceFinish(): void
     $record['php_cpu_ms'] = round(max(0, performanceCpu() - $record['_cpu_started']), 3);
     $record['peak_memory_bytes'] = memory_get_peak_usage(true);
     $record['status'] = http_response_code() ?: 200;
+    // Retain uploads, copies, failures and slow metadata requests, not every fast query.
+    if (!in_array($record['method'], ['PUT', 'COPY'], true)
+        && $record['status'] < 400 && $record['php_wall_ms'] < 100) return;
     $fatal = error_get_last();
     if ($fatal && in_array($fatal['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
         $record['fatal_error_type'] = $fatal['type'];
@@ -148,6 +151,79 @@ function performanceFinish(): void
         if (is_resource($output)) fclose($output);
         if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
     }
+}
+
+function performanceSummary(string $snapshot): string
+{
+    $records = $uploads = $operations = $slow = []; $statuses = []; $phases = [];
+    $bytes = 0; $success = 0; $failed = 0; $copyCount = 0; $first = null; $last = null;
+    foreach (explode("\n", $snapshot) as $line) {
+        $row = json_decode($line, true);
+        if (!is_array($row) || !isset($row['method'], $row['php_wall_ms'], $row['started_unix'], $row['finished_unix'])) continue;
+        $status = (int) ($row['status'] ?? 0); $statuses[$status] = ($statuses[$status] ?? 0) + 1;
+        $records[] = $row;
+        if ($row['method'] === 'PUT') {
+            $uploads[] = $row;
+            $first = $first === null ? $row['started_unix'] : min($first, $row['started_unix']);
+            $last = $last === null ? $row['finished_unix'] : max($last, $row['finished_unix']);
+            if ($status >= 200 && $status < 300) { ++$success; $bytes += $row['published_bytes'] ?? 0; }
+            else ++$failed;
+        }
+        if (in_array($row['method'], ['PUT', 'COPY'], true)) {
+            $operations[] = $row;
+            if ($row['method'] === 'COPY') ++$copyCount;
+            foreach ($row['phase_ms'] ?? [] as $phase => $ms) $phases[$phase][] = (float) $ms;
+            if (isset($row['log_lock_wait_ms'])) $phases['log_lock_wait'][] = (float) $row['log_lock_wait_ms'];
+        }
+        $slow[] = $row;
+        usort($slow, fn($a, $b) => $b['php_wall_ms'] <=> $a['php_wall_ms']);
+        $slow = array_slice($slow, 0, 5);
+    }
+    if (!$records) return "暂无关键操作日志。请先用 rclone 上传，再查看或复制摘要。\n";
+    $latest = $records[count($records) - 1];
+    $lines = ['QinDav 性能摘要', sprintf('应用 %s · PHP %s · %s · OPcache %s',
+        $latest['app_version'] ?? '?', $latest['php_version'] ?? '?', $latest['php_sapi'] ?? '?', !empty($latest['opcache_enabled']) ? '开' : '关')];
+    $lines[] = sprintf('已记录 %d 个关键请求；上传成功 %d / 失败 %d；COPY %d', count($records), $success, $failed, $copyCount);
+    if ($uploads) {
+        $seconds = max(0.000001, $last - $first);
+        $lines[] = sprintf('上传窗口 %s — %s UTC，%.3f 秒', gmdate('Y-m-d H:i:s', (int) $first), gmdate('H:i:s', (int) $last), $seconds);
+        $lines[] = sprintf('成功上传 %.2f MiB，PHP 记录窗口平均 %.2f MiB/s', $bytes / 1048576, $bytes / 1048576 / $seconds);
+    }
+    ksort($statuses);
+    $codes = []; foreach ($statuses as $code => $count) $codes[] = $code . '×' . $count;
+    $lines[] = '状态码：' . implode('，', $codes);
+    if ($operations) {
+        $walls = array_column($operations, 'php_wall_ms'); sort($walls, SORT_NUMERIC);
+        $p95 = $walls[max(0, (int) ceil(count($walls) * .95) - 1)];
+        $cpu = array_sum(array_column($operations, 'php_cpu_ms')) / count($operations);
+        $peak = max(array_column($operations, 'peak_memory_bytes') ?: [0]) / 1048576;
+        $lines[] = sprintf('上传/COPY：PHP 总耗时均值 %.3f ms，P95 %.3f ms，CPU 均值 %.3f ms，峰值内存 %.1f MiB', array_sum($walls) / count($walls), $p95, $cpu, $peak);
+        $lines[] = '';
+        $lines[] = '关键阶段：均值 / P95（ms；嵌套项不直接相加）';
+        $labels = ['bootstrap' => 'PHP 启动', 'config' => '配置读取', 'authentication' => '认证', 'file_open' => '临时文件创建',
+            'quota_reserve' => '容量预留', 'copy_io' => '读取请求体＋写入文件', 'validate_flush' => '校验＋刷新',
+            'publish' => '文件发布＋记账', 'file_rename' => '原子重命名', 'storage_lock_wait' => '容量锁等待',
+            'storage_lock_hold' => '容量锁持有', 'ledger_read' => '账本读取',
+            'ledger_write' => '账本写入', 'usage_scan' => '用量恢复扫描', 'cleanup' => '收尾', 'log_lock_wait' => '日志锁等待'];
+        foreach ($labels as $key => $label) {
+            if (empty($phases[$key])) continue;
+            $values = $phases[$key]; sort($values, SORT_NUMERIC);
+            $lines[] = sprintf('%s：%.3f / %.3f', $label, array_sum($values) / count($values), $values[max(0, (int) ceil(count($values) * .95) - 1)]);
+        }
+        $lines[] = sprintf('每请求账本写入 %.2f 次，容量锁 %.2f 次', array_sum(array_column($operations, 'ledger_write_count')) / count($operations), array_sum(array_column($operations, 'storage_lock_count')) / count($operations));
+        $cache = ['hit' => 0, 'miss' => 0];
+        foreach ($operations as $row) if (isset($cache[$row['auth_cache'] ?? ''])) ++$cache[$row['auth_cache']];
+        $lines[] = sprintf('认证缓存：命中 %d / 未命中 %d', $cache['hit'], $cache['miss']);
+    }
+    $lines[] = ''; $lines[] = '最慢请求（最多 5 条）：';
+    foreach ($slow as $row) {
+        $lines[] = sprintf('%s UTC %s %d · %.2f MiB · 总 %.3f ms / 复制 %.3f ms / 锁等待 %.3f ms',
+            gmdate('H:i:s', (int) $row['started_unix']), $row['method'], $row['status'] ?? 0, ($row['copied_bytes'] ?? 0) / 1048576,
+            $row['php_wall_ms'], $row['phase_ms']['copy_io'] ?? 0, $row['phase_ms']['storage_lock_wait'] ?? 0);
+    }
+    $lines[] = ''; $lines[] = '范围：仅 PHP 执行阶段，复制耗时包含读取等待与写入；不含客户端缓存和 PHP 执行前的上游等待。';
+    $lines[] = '平均速度包含窗口内空闲时间，建议每轮上传前清空日志。';
+    return implode("\n", $lines) . "\n";
 }
 
 function stateDir(): string
@@ -1528,7 +1604,7 @@ function handleApi(array $cfg, string $action): never
         header('Content-Type: text/plain; charset=utf-8');
         header('Cache-Control: no-store');
         header('X-Content-Type-Options: nosniff');
-        echo $snapshot === '' ? "暂无 WebDAV 请求日志。上传完成后重新打开此地址。\n" : $snapshot;
+        echo ($_GET['raw'] ?? '') === '1' ? $snapshot : performanceSummary($snapshot);
         exit;
     }
 
@@ -1555,6 +1631,17 @@ function handleApi(array $cfg, string $action): never
     if ($raw === false || strlen($raw) > 8192) jsonResponse(['error' => '请求过大'], 413);
     $body = json_decode($raw, true, 8, JSON_THROW_ON_ERROR);
     if (!is_array($body)) jsonResponse(['error' => '请求格式错误'], 400);
+    if ($action === 'performance-clear') {
+        $root = stateDir(); $lock = fopen($root . '/performance.log.lock', 'c');
+        if ($lock === false || !flock($lock, LOCK_EX)) throw new RuntimeException('Cannot clear diagnostic log');
+        try {
+            foreach (['performance.ndjson', 'performance.previous.ndjson'] as $name) {
+                $path = $root . '/' . $name;
+                if (file_exists($path) && !unlink($path)) throw new RuntimeException('Cannot clear diagnostic log');
+            }
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
+        jsonResponse(['ok' => true]);
+    }
     if ($action === 'update-info') jsonResponse(updateCapabilities() + updateBackups());
     if ($action === 'update-backup-limit') {
         $keep = $body['keep'] ?? null;
@@ -1734,6 +1821,7 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
 @media(min-width:1600px){.app main{padding:0 40px}}
 @media(max-width:700px){.app main{padding:0 12px}.app header{height:48px}.app .browser-bar{flex-direction:column;align-items:stretch;padding:6px 0 8px;gap:6px}.app .crumb{flex:none;width:100%;min-height:28px}.browser-tools{gap:6px;width:100%}.app .filter{width:auto;flex:1;min-width:80px}.app .filter input{font-size:12px;padding-right:6px}.app .browser-tools .tools{gap:4px;flex-shrink:0}.app .browser-tools button{padding:6px 7px;font-size:12px}.app th:nth-child(2){width:68px}.app th.actions{width:76px}.app td{padding:6px 5px;height:44px}.app .name{gap:7px;font-size:12px}.app .row-actions button{min-width:34px;min-height:34px;padding:7px}.app .pager{gap:5px;min-height:40px}.app .pager button{padding:6px;font-size:11px}.app .pager .info{font-size:11px}.app .file-icon{width:20px;height:23px}}
 .upload-panel{flex-shrink:0;border:1px solid #dce8f0;border-radius:10px;background:#f7fbfe;padding:12px 16px;margin-bottom:10px}.upload-summary,.upload-detail{display:flex;justify-content:space-between;gap:16px}.upload-summary{font-size:13px}.upload-summary strong{font-weight:500}.upload-summary-actions{display:flex;align-items:center;gap:12px}#upload-close{padding:0;border:0;line-height:1;font-size:19px}#upload-close[hidden]{display:none}.upload-detail{font-size:12px;color:#748593}.upload-panel progress{display:block;width:100%;height:6px;border:0;border-radius:8px;overflow:hidden;accent-color:var(--accent);margin:9px 0;background:#e4edf3}.upload-panel progress::-webkit-progress-bar{background:#e4edf3}.upload-panel progress::-webkit-progress-value{background:var(--accent);border-radius:8px;transition:width .15s}.upload-panel progress::-moz-progress-bar{background:var(--accent)}#upload-current{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.action-dialog{border:1px solid #e5ebf0;border-radius:16px;width:min(420px,calc(100vw - 32px));padding:26px;box-shadow:0 22px 80px #23384930;color:var(--ink)}.action-dialog::backdrop{background:#28374655;backdrop-filter:blur(3px)}.action-dialog h2{font-size:19px;margin:14px 0 8px}.action-dialog p{color:#73808b;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 20px}.action-dialog input{width:100%}.action-symbol{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:#eaf4fc;color:var(--accent);font-size:22px}.action-dialog.danger .action-symbol{color:#c05c5c;background:#fcEEEE}.action-dialog.danger #action-submit{background:#be5d5d;border-color:#be5d5d}.action-controls{display:flex;justify-content:flex-end;gap:8px;margin-top:22px}.action-dialog label[hidden],.upload-panel[hidden]{display:none}@media(max-width:700px){.app .browser-tools .tools{flex-wrap:wrap;flex-shrink:1;min-width:0;justify-content:flex-end}.upload-panel{padding:10px 12px}.upload-detail{gap:8px;flex-wrap:wrap}}
+.performance-output{width:100%;border:1px solid #dce3e8;border-radius:6px;padding:12px;background:#f8fafc;color:var(--ink);font:12px/1.65 ui-monospace,monospace;resize:vertical}.performance-output[hidden]{display:none}
 </style>
 <body<?= $loggedIn ? ' class="app"' : '' ?>>
 <main>
@@ -1749,7 +1837,7 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
 <div class="table-wrap" id="file-list" aria-busy="true"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="loading-cell">正在读取文件…</td></tr></tbody></table></div>
 <div class="pager"><span class="info" id="capacity"></span><div><button id="prev">上一页</button><button id="next">下一页</button></div></div>
 </section>
-<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
+<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="performance-title"><h3 id="performance-title">性能日志</h3><p class="info">记录上传、复制、异常和超过 100 ms 的请求。每轮上传前清空，完成后复制摘要用于分析。</p><div class="tools"><button id="performance-view" type="button">查看摘要</button><button id="performance-copy" type="button">复制摘要</button><button id="performance-clear" type="button">清空日志</button></div><textarea id="performance-output" class="performance-output" rows="10" readonly spellcheck="false" aria-label="性能日志摘要" hidden></textarea><div class="status" id="performance-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
 <dialog id="action-dialog" class="action-dialog" aria-labelledby="action-title" aria-describedby="action-message"><form id="action-form"><div class="action-symbol" id="action-symbol" aria-hidden="true">!</div><h2 id="action-title"></h2><p id="action-message"></p><label id="action-input-label" hidden><span class="label" id="action-label"></span><input id="action-input" autocomplete="off" spellcheck="false"></label><div class="action-controls"><button type="button" id="action-cancel">取消</button><button type="submit" id="action-submit" class="primary">确认</button></div></form></dialog>
 <script nonce="<?= html($nonce) ?>">
 'use strict';
@@ -1879,6 +1967,11 @@ $('settings-close').onclick=closeSettings;
 settings.addEventListener('cancel',hideAppPassword);
 settings.addEventListener('close',()=>{hideAppPassword();$('app-result').textContent='';document.body.classList.remove('modal-open');$('settings-button').setAttribute('aria-expanded','false');});
 settings.addEventListener('click',event=>{const rect=settings.getBoundingClientRect();if(event.target===settings&&(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom))closeSettings();});
+async function readPerformance(){const response=await fetch('/?api=performance-log',{credentials:'same-origin',cache:'no-store'});if(!response.ok)throw Error('读取日志失败，请检查登录状态');return response.text();}
+function setPerformanceBusy(busy){for(const id of ['performance-view','performance-copy','performance-clear'])$(id).disabled=busy;}
+$('performance-view').onclick=async()=>{const output=$('performance-output');if(!output.hidden){output.hidden=true;$('performance-view').textContent='查看摘要';return;}setPerformanceBusy(true);$('performance-result').textContent='正在整理摘要…';try{output.value=await readPerformance();output.hidden=false;$('performance-view').textContent='收起摘要';$('performance-result').textContent='';}catch(e){$('performance-result').textContent=e.message;}finally{setPerformanceBusy(false);}};
+$('performance-copy').onclick=async()=>{setPerformanceBusy(true);$('performance-result').textContent='正在整理摘要…';try{const text=await readPerformance();try{await navigator.clipboard.writeText(text);$('performance-result').textContent='性能摘要已复制';}catch{const output=$('performance-output');output.value=text;output.hidden=false;output.focus();output.select();$('performance-view').textContent='收起摘要';$('performance-result').textContent='请手动复制已选中的摘要';}}catch(e){$('performance-result').textContent=e.message;}finally{setPerformanceBusy(false);}};
+$('performance-clear').onclick=async()=>{if(!await ask({title:'清空性能日志',message:'清理上一轮诊断记录。建议在下一轮上传开始前操作。',confirm:'清空'}))return;setPerformanceBusy(true);try{await api('performance-clear');$('performance-output').value='';$('performance-output').hidden=true;$('performance-view').textContent='查看摘要';$('performance-result').textContent='日志已清空，可以开始下一轮上传';}catch(e){$('performance-result').textContent=e.message;}finally{setPerformanceBusy(false);}};
 $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText(endpoint);status('连接地址已复制');}catch{status(endpoint);}};
 $('refresh').onclick=()=>load();$('prev').onclick=()=>{if(!loading)load({nextOffset:Math.max(0,offset-200),reloadStorage:false});};$('next').onclick=()=>{if(!loading&&hasMore)load({nextOffset:offset+200,reloadStorage:false});};
 $('mkdir').onclick=async()=>{const name=await ask({title:'新建文件夹',message:'在当前目录创建一个文件夹。',label:'文件夹名称',value:'',confirm:'创建'});if(!name)return;if(name.includes('/')||name.includes('\\')||name==='.'||name==='..'){status('请输入有效的文件夹名称');return;}try{await request((path?path+'/':'')+name,{method:'MKCOL'});status('文件夹已创建');await load();}catch(e){status(e.message);}};
