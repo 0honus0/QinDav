@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.4';
+const QINDAV_VERSION = '1.4.5';
 const PERFORMANCE_LOG_ENABLED = true;
 const PERFORMANCE_LOG_MAX_BYTES = 2 * 1024 * 1024;
 performanceStart();
@@ -80,18 +80,37 @@ function performanceCopy(mixed $input, mixed $output, ?int $maximum): int
 {
     $bytes = $reads = $writes = 0;
     $readNs = $writeNs = $readMax = $writeMax = 0;
+    $copyStarted = hrtime(true); $windowStarted = $copyStarted;
+    $received = $windowBytes = $windows = $firstBytes = $stalls = $slowReads = 0;
+    $firstData = $lastData = $firstMiB = null;
+    $rateMin = $rateMax = null; $stallNs = $worstOffset = 0;
     try {
         while ($maximum === null || $bytes < $maximum + 1) {
             $length = $maximum === null ? 8192 : min(8192, $maximum + 1 - $bytes);
             $started = hrtime(true);
             try { $chunk = fread($input, $length); }
-            finally { $elapsed = hrtime(true) - $started; $readNs += $elapsed; $readMax = max($readMax, $elapsed); ++$reads; }
+            finally {
+                $readEnded = hrtime(true); $elapsed = $readEnded - $started;
+                $readNs += $elapsed; ++$reads;
+                if ($elapsed > $readMax) { $readMax = $elapsed; $worstOffset = $received; }
+                if ($elapsed >= 10000000) ++$slowReads;
+                if ($elapsed >= 100000000) { ++$stalls; $stallNs += $elapsed; }
+            }
             if ($chunk === false) throw new DAV\Exception\BadRequest('Upload read failed');
             if ($chunk === '') {
                 if (feof($input)) break;
                 throw new DAV\Exception\BadRequest('Upload stream stalled');
             }
             $offset = 0; $size = strlen($chunk);
+            $received += $size; $windowBytes += $size; $lastData = $readEnded;
+            if ($firstData === null) { $firstData = $readEnded; $firstBytes = $size; }
+            if ($firstMiB === null && $received >= 1048576) $firstMiB = ($readEnded - $copyStarted) / 1e6;
+            if ($windowBytes >= 1048576) {
+                $rate = $windowBytes / 1048576 / max(1e-9, ($readEnded - $windowStarted) / 1e9);
+                $rateMin = $rateMin === null ? $rate : min($rateMin, $rate);
+                $rateMax = $rateMax === null ? $rate : max($rateMax, $rate);
+                ++$windows; $windowBytes = 0; $windowStarted = $readEnded;
+            }
             while ($offset < $size) {
                 $started = hrtime(true);
                 try { $written = fwrite($output, $offset === 0 ? $chunk : substr($chunk, $offset)); }
@@ -105,6 +124,16 @@ function performanceCopy(mixed $input, mixed $output, ?int $maximum): int
         performanceSet('copied_bytes', $bytes);
         performanceSet('io_read_calls', $reads); performanceSet('io_write_calls', $writes);
         performanceSet('io_read_max_ms', $readMax / 1e6); performanceSet('io_write_max_ms', $writeMax / 1e6);
+        performanceSet('io_received_bytes', $received);
+        performanceSet('io_first_data_ms', $firstData === null ? null : ($firstData - $copyStarted) / 1e6);
+        performanceSet('io_first_mib_ms', $firstMiB);
+        performanceSet('io_sustained_mib_s', $firstData !== null && $lastData > $firstData
+            ? ($received - $firstBytes) / 1048576 / (($lastData - $firstData) / 1e9) : null);
+        performanceSet('io_window_count', $windows);
+        performanceSet('io_window_min_mib_s', $rateMin); performanceSet('io_window_max_mib_s', $rateMax);
+        performanceSet('io_read_ge10ms_count', $slowReads); performanceSet('io_read_ge100ms_count', $stalls);
+        performanceSet('io_read_ge100ms_total_ms', $stallNs / 1e6);
+        performanceSet('io_worst_read_offset_bytes', $worstOffset);
         if (isset($GLOBALS['qinPerf'])) {
             $GLOBALS['qinPerf']['phase_ms']['input_read'] = $readNs / 1e6;
             $GLOBALS['qinPerf']['phase_ms']['output_write'] = $writeNs / 1e6;
@@ -118,8 +147,11 @@ function performanceStart(): void
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     if (!str_starts_with($path, '/index.php/')) return;
     try {
+        $usage = function_exists('getrusage') ? (getrusage() ?: []) : [];
+        $protocol = $_SERVER['SERVER_PROTOCOL'] ?? '';
+        $expect = strtolower(trim($_SERVER['HTTP_EXPECT'] ?? ''));
         $GLOBALS['qinPerf'] = [
-            '_started' => hrtime(true), '_cpu_started' => performanceCpu(),
+            '_started' => hrtime(true), '_cpu_started' => performanceCpu(), '_usage_started' => $usage,
             'schema' => 1, 'request_id' => bin2hex(random_bytes(6)), 'started_unix' => microtime(true),
             'method' => substr((string) ($_SERVER['REQUEST_METHOD'] ?? ''), 0, 20),
             'pid' => getmypid(), 'app_version' => QINDAV_VERSION, 'php_version' => PHP_VERSION, 'php_sapi' => PHP_SAPI,
@@ -128,6 +160,9 @@ function performanceStart(): void
             'body_expected_bytes' => isset($_SERVER['CONTENT_LENGTH']) ? max(0, (int) $_SERVER['CONTENT_LENGTH']) : null,
             'body_mode' => isset($_SERVER['CONTENT_LENGTH']) ? 'content-length'
                 : (stripos($_SERVER['HTTP_TRANSFER_ENCODING'] ?? '', 'chunked') !== false ? 'chunked' : 'unknown'),
+            'server_protocol' => in_array($protocol, ['HTTP/1.0', 'HTTP/1.1', 'HTTP/2', 'HTTP/2.0', 'HTTP/3', 'HTTP/3.0'], true) ? $protocol : 'unknown',
+            'expect_mode' => $expect === '' ? 'none' : ($expect === '100-continue' ? '100-continue' : 'other'),
+            'transfer_chunked_visible' => stripos($_SERVER['HTTP_TRANSFER_ENCODING'] ?? '', 'chunked') !== false,
             'client' => preg_match('/^rclone\/(v?[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[0-9A-Za-z.]+)?)/', $_SERVER['HTTP_USER_AGENT'] ?? '', $match) ? 'rclone/' . substr($match[1], 0, 64) : 'other',
             'copied_bytes' => 0, 'published_bytes' => 0, 'ledger_write_count' => 0, 'storage_lock_count' => 0, 'phase_ms' => [],
         ];
@@ -148,12 +183,16 @@ function performanceFinish(): void
     // Retain uploads, copies, failures and slow metadata requests, not every fast query.
     if (!in_array($record['method'], ['PUT', 'COPY'], true)
         && $record['status'] < 400 && $record['php_wall_ms'] < 100) return;
+    $usage = function_exists('getrusage') ? (getrusage() ?: []) : [];
+    foreach (['ru_nvcsw' => 'voluntary_context_switches', 'ru_nivcsw' => 'involuntary_context_switches'] as $key => $label) {
+        if (isset($usage[$key], $record['_usage_started'][$key])) $record[$label] = max(0, $usage[$key] - $record['_usage_started'][$key]);
+    }
     $fatal = error_get_last();
     if ($fatal && in_array($fatal['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
         $record['fatal_error_type'] = $fatal['type'];
     }
     foreach ($record['phase_ms'] as &$ms) $ms = round($ms, 3);
-    unset($ms, $record['_started'], $record['_cpu_started']);
+    unset($ms, $record['_started'], $record['_cpu_started'], $record['_usage_started']);
     $topLevel = ['bootstrap', 'config', 'authentication', 'file_open', 'quota_reserve', 'copy_io', 'validate_flush', 'publish', 'file_close', 'cleanup'];
     $classified = 0;
     foreach ($topLevel as $phase) $classified += $record['phase_ms'][$phase] ?? 0;
@@ -237,6 +276,20 @@ function performanceSummary(string $snapshot): string
     ksort($statuses);
     $codes = []; foreach ($statuses as $code => $count) $codes[] = $code . '×' . $count;
     $lines[] = '状态码：' . implode('，', $codes);
+    if ($uploads) {
+        $transport = [];
+        foreach ($uploads as $row) {
+            $key = ($row['server_protocol'] ?? 'unknown') . ' / ' . ($row['body_mode'] ?? 'unknown')
+                . ' / Expect=' . ($row['expect_mode'] ?? 'unknown')
+                . (!empty($row['transfer_chunked_visible']) ? ' / TE=chunked' : '');
+            $transport[$key] = ($transport[$key] ?? 0) + 1;
+        }
+        arsort($transport); $parts = [];
+        foreach (array_slice($transport, 0, 8, true) as $key => $count) $parts[] = $key . '×' . $count;
+        $lines[] = 'PHP 可见传输特征：' . implode('；', $parts);
+        $lengths = array_values(array_filter(array_column($uploads, 'body_expected_bytes'), fn($value) => $value !== null));
+        if ($lengths) $lines[] = sprintf('Content-Length：%d 个请求，%.2f—%.2f MiB', count($lengths), min($lengths) / 1048576, max($lengths) / 1048576);
+    }
     if ($errors) {
         uasort($errors, fn($a, $b) => $b['count'] <=> $a['count']);
         $parts = [];
@@ -253,6 +306,10 @@ function performanceSummary(string $snapshot): string
         $cpu = array_sum(array_column($operations, 'php_cpu_ms')) / count($operations);
         $peak = max(array_column($operations, 'peak_memory_bytes') ?: [0]) / 1048576;
         $lines[] = sprintf('上传/COPY：PHP 总耗时均值 %.3f ms，P95 %.3f ms，CPU 均值 %.3f ms，峰值内存 %.1f MiB', array_sum($walls) / count($walls), $p95, $cpu, $peak);
+        $scheduled = array_values(array_filter($operations, fn($row) => isset($row['voluntary_context_switches'], $row['involuntary_context_switches'])));
+        if ($scheduled) $lines[] = sprintf('进程上下文切换（%d 请求）：主动均值 %.1f 次，被动均值 %.1f 次 / 最大 %d 次；计数不能直接判定原因',
+            count($scheduled), array_sum(array_column($scheduled, 'voluntary_context_switches')) / count($scheduled),
+            array_sum(array_column($scheduled, 'involuntary_context_switches')) / count($scheduled), max(array_column($scheduled, 'involuntary_context_switches')));
         $lines[] = '';
         $lines[] = '关键阶段：均值 / P95（ms；嵌套项不直接相加）';
         $labels = ['bootstrap' => 'PHP 启动', 'config' => '配置读取', 'authentication' => '认证', 'file_open' => '临时文件创建',
@@ -277,6 +334,24 @@ function performanceSummary(string $snapshot): string
                 count($diagnostics), array_sum(array_column($diagnostics, 'io_read_calls')) / count($diagnostics),
                 array_sum(array_column($diagnostics, 'io_write_calls')) / count($diagnostics),
                 max(array_column($diagnostics, 'io_read_max_ms') ?: [0]), max(array_column($diagnostics, 'io_write_max_ms') ?: [0]));
+            $progress = array_values(array_filter($diagnostics, fn($row) => isset($row['io_received_bytes'])));
+            if ($progress) {
+                $metric = function (string $key) use ($progress): string {
+                    $values = array_values(array_filter(array_column($progress, $key), fn($value) => $value !== null));
+                    if (!$values) return '无样本';
+                    sort($values, SORT_NUMERIC);
+                    return sprintf('%.3f / %.3f ms', array_sum($values) / count($values), $values[max(0, (int) ceil(count($values) * .95) - 1)]);
+                };
+                $lines[] = '读取进度（均值/P95）：首个非空块 ' . $metric('io_first_data_ms') . '；首个 MiB ' . $metric('io_first_mib_ms');
+                $rates = array_values(array_filter(array_column($progress, 'io_sustained_mib_s'), fn($value) => $value !== null));
+                if ($rates) $lines[] = sprintf('首块后单请求观察速度：均值 %.2f MiB/s，最低 %.2f / 最高 %.2f（含交错写入及调度）', array_sum($rates) / count($rates), min($rates), max($rates));
+                $mins = array_values(array_filter(array_column($progress, 'io_window_min_mib_s'), fn($value) => $value !== null));
+                $maxs = array_values(array_filter(array_column($progress, 'io_window_max_mib_s'), fn($value) => $value !== null));
+                if ($mins && $maxs) $lines[] = sprintf('约 1 MiB 窗口 %d 个：最低 %.2f / 最高 %.2f MiB/s（含首块等待，末尾不足 1 MiB 不计窗口）', array_sum(array_column($progress, 'io_window_count')), min($mins), max($maxs));
+                $lines[] = sprintf('慢读取 ≥10 ms：%d 次；其中 ≥100 ms：%d 次，合计 %.3f ms（跨并发请求相加）',
+                    array_sum(array_column($progress, 'io_read_ge10ms_count')), array_sum(array_column($progress, 'io_read_ge100ms_count')),
+                    array_sum(array_column($progress, 'io_read_ge100ms_total_ms')));
+            }
             $lines[] = '分段计时会增加循环与计时开销；写入耗时包含系统缓存接收，不代表物理磁盘落盘耗时。';
         }
     }
@@ -286,9 +361,12 @@ function performanceSummary(string $snapshot): string
             gmdate('H:i:s', (int) $row['started_unix']), $row['method'], $row['status'] ?? 0, ($row['copied_bytes'] ?? 0) / 1048576,
             $row['php_wall_ms'], $row['phase_ms']['copy_io'] ?? 0, $row['phase_ms']['storage_lock_wait'] ?? 0);
         if (($row['copy_mode'] ?? '') === 'split-8k') $lines[count($lines) - 1] .= sprintf(' / 读取 %.3f ms / 写入 %.3f ms', $row['phase_ms']['input_read'] ?? 0, $row['phase_ms']['output_write'] ?? 0);
+        if (isset($row['io_received_bytes'])) $lines[count($lines) - 1] .= sprintf(' / 慢读取≥100ms %d 次 / 最慢读取 %.3f ms @ %.2f MiB',
+            $row['io_read_ge100ms_count'] ?? 0, $row['io_read_max_ms'] ?? 0, ($row['io_worst_read_offset_bytes'] ?? 0) / 1048576);
     }
     $lines[] = ''; $lines[] = '范围：仅 PHP 执行阶段，复制耗时包含读取等待与写入；不含客户端缓存和 PHP 执行前的上游等待。';
     $lines[] = '平均速度包含窗口内空闲时间，建议每轮上传前清空日志。';
+    if ($uploads) $lines[] = '协议与请求头仅反映 PHP 可见值，上游可能已转换；读取耗时也可能包含进程调度，不能单凭这些计数定位网络或前置服务。';
     return implode("\n", $lines) . "\n";
 }
 
@@ -1916,7 +1994,7 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
 <div class="table-wrap" id="file-list" aria-busy="true"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="loading-cell">正在读取文件…</td></tr></tbody></table></div>
 <div class="pager"><span class="info" id="capacity"></span><div><button id="prev">上一页</button><button id="next">下一页</button></div></div>
 </section>
-<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="performance-title"><h3 id="performance-title">性能日志</h3><p class="info">记录上传、复制、异常和超过 100 ms 的请求。每轮上传前清空，完成后复制摘要用于分析。</p><label class="performance-toggle"><input id="performance-split" type="checkbox"<?= !empty($cfg['performance_split_io']) ? ' checked' : '' ?>> 开启读写分段诊断</label><p class="info">仅用于一轮诊断，完成后关闭。使用 8 KiB 分段计时，可能影响速度；关闭时使用原生流复制。</p><div class="tools"><button id="performance-view" type="button">查看摘要</button><button id="performance-copy" type="button">复制摘要</button><button id="performance-clear" type="button">清空日志</button></div><textarea id="performance-output" class="performance-output" rows="10" readonly spellcheck="false" aria-label="性能日志摘要" hidden></textarea><div class="status" id="performance-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
+<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="performance-title"><h3 id="performance-title">性能日志</h3><p class="info">记录上传、复制、异常和超过 100 ms 的请求。每轮上传前清空，完成后复制摘要用于分析。</p><label class="performance-toggle"><input id="performance-split" type="checkbox"<?= !empty($cfg['performance_split_io']) ? ' checked' : '' ?>> 开启读写分段诊断</label><p class="info">仅用于一轮诊断，完成后关闭。记录读写耗时、首块等待和约 1 MiB 窗口速度；使用 8 KiB 分段计时，可能影响速度。关闭时使用原生流复制。</p><div class="tools"><button id="performance-view" type="button">查看摘要</button><button id="performance-copy" type="button">复制摘要</button><button id="performance-clear" type="button">清空日志</button></div><textarea id="performance-output" class="performance-output" rows="10" readonly spellcheck="false" aria-label="性能日志摘要" hidden></textarea><div class="status" id="performance-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
 <dialog id="action-dialog" class="action-dialog" aria-labelledby="action-title" aria-describedby="action-message"><form id="action-form"><div class="action-symbol" id="action-symbol" aria-hidden="true">!</div><h2 id="action-title"></h2><p id="action-message"></p><label id="action-input-label" hidden><span class="label" id="action-label"></span><input id="action-input" autocomplete="off" spellcheck="false"></label><div class="action-controls"><button type="button" id="action-cancel">取消</button><button type="submit" id="action-submit" class="primary">确认</button></div></form></dialog>
 <script nonce="<?= html($nonce) ?>">
 'use strict';
