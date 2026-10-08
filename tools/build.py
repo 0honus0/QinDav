@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package the management app, dedicated DAV entry and runtime dependencies."""
+"""Package the single PHP entry and runtime dependencies."""
 import hashlib
 import json
 import argparse
@@ -16,7 +16,6 @@ def build(version=None):
     if not (ROOT / 'vendor/autoload.php').is_file():
         raise SystemExit('Run composer install --no-dev --optimize-autoloader first.')
     subprocess.run(['php', '-l', str(ROOT / 'index.php')], check=True)
-    subprocess.run(['php', '-l', str(ROOT / 'dav.php')], check=True)
     DIST.mkdir(exist_ok=True)
     archive = DIST / 'QinDav.zip'
     source = (ROOT / 'index.php').read_text()
@@ -29,7 +28,6 @@ def build(version=None):
             raise SystemExit('Application version constant missing or duplicated')
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         bundle.writestr('index.php', source)
-        bundle.write(ROOT / 'dav.php', 'dav.php')
         for path in sorted((ROOT / 'vendor').rglob('*')):
             if path.is_file() and not path.is_symlink():
                 bundle.write(path, path.relative_to(ROOT).as_posix())
@@ -39,6 +37,8 @@ def build(version=None):
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (DIST / 'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
     with zipfile.ZipFile(archive) as bundle:
+        if any(name != 'index.php' and not name.startswith('vendor/') for name in bundle.namelist()):
+            raise SystemExit('Package must contain only index.php and vendor/.')
         if bundle.testzip() is not None:
             raise SystemExit('Archive verification failed.')
         entries = len(bundle.namelist())

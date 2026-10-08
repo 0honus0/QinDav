@@ -47,7 +47,8 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
 '''
     source = source[:start] + stub + source[end:]
     (app / 'index.php').write_text(source)
-    shutil.copy(ROOT / 'dav.php', app / 'dav.php')
+    # A legacy entry exercises snapshot migration and rollback to an older layout.
+    (app / 'dav.php').write_text('<?php // legacy entry fixture')
     shutil.copy(ROOT / 'tools/router.php', app / 'tools/router.php')
     shutil.copytree(ROOT / 'vendor', app / 'vendor')
     original_files = {p.relative_to(app).as_posix(): p.read_bytes() for p in app.rglob('*') if p.is_file()}
@@ -61,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
         (fixtures / 'release.json').write_text(json.dumps(release))
         with zipfile.ZipFile(fixtures / 'QinDav.zip', 'w', zipfile.ZIP_DEFLATED) as z:
             for name, data in original_files.items():
-                if name.startswith('tools/'):
+                if name.startswith('tools/') or name == 'dav.php':
                     continue
                 if name == 'index.php':
                     data = re.sub(r"const QINDAV_VERSION = '[0-9]+\.[0-9]+\.[0-9]+';",
@@ -131,6 +132,8 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             check(not (tmp / 'outside.php').exists(), 'no traversal file written')
             fixture('1.2.0', {'config.json': b'bad'})
             check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'unexpected root file rejected')
+            fixture('1.2.0', {'dav.php': b'<?php // unwanted second entry'})
+            check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'second PHP entry rejected in new package')
             fixture('1.2.0', invalid_version=True)
             check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'archive version mismatch rejected')
             check(c.api('update-info')[1]['current'] == '1.1.0', 'validation failures preserve old code')
@@ -138,7 +141,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
                 # Direct fixture edits bypass the updater's OPcache invalidation; the fault-injection server disables OPcache.
                 # Inject a publication failure in the disposable copy, after vendor replacement.
                 before_fault = (app / 'index.php').read_text()
-                broken = before_fault.replace("if (!rename($job . '/new/' . $name, $live))", "if ($name === 'dav.php' || !rename($job . '/new/' . $name, $live))")
+                broken = before_fault.replace("if (!rename($job . '/new/' . $name, $live))", "if ($name === 'index.php' || !rename($job . '/new/' . $name, $live))")
                 check(broken != before_fault, 'publication failure hook injected in test copy only')
                 (app / 'index.php').write_text(broken)
                 fixture('1.2.0')
@@ -149,6 +152,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             fixture('1.2.0')
             check(c.api('update-install', {'version': '1.3.0'})[0] == 409, 'changed release requires confirmation again')
             check(c.api('update-install', {'version': '1.2.0'})[0] == 200, 'update installed')
+            check(not (app / 'dav.php').exists(), 'single-entry update removes legacy entry')
             info = c.api('update-info')[1]
             check(info['current'] == '1.2.0' and len(info['backups']) == 1 and info['backups'][0]['version'] == '1.1.0',
                   'new code active and previous code backed up')
@@ -159,6 +163,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             check(c.api('update-check')[1]['available'] is False, 'current release not reinstallable')
             check(c.api('update-install', {'version': '1.2.0'})[0] == 409, 'same version update rejected')
             check(c.api('update-restore', {'id': a})[0] == 200, 'rollback installed')
+            check((app / 'dav.php').is_file(), 'rollback restores legacy snapshot file')
             info = c.api('update-info')[1]
             check(info['current'] == '1.1.0' and len(info['backups']) == 2, 'rollback backs up newer code')
             b = next(item['id'] for item in info['backups'] if item['version'] == '1.2.0')
@@ -167,9 +172,10 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
                 check(c.api('update-restore', {'id': target})[0] == 200, 'repeated rollback works')
                 info = c.api('update-info')[1]
                 check(info['current'] == expected, 'repeated rollback activates target')
+                check((app / 'dav.php').exists() == (expected == '1.1.0'), 'entry layout matches restored snapshot')
                 check(set(item['id'] for item in info['backups']) == {a, b}, 'exact backups reused instead of duplicated')
             check(len(list((state / 'updates').glob('job-*'))) == 2, 'no duplicate snapshot directories left behind')
-            bad = state / 'updates' / b / 'old' / 'dav.php'; old = bad.read_bytes(); bad.write_bytes(b'tampered')
+            bad = state / 'updates' / b / 'old' / 'index.php'; old = bad.read_bytes(); bad.write_bytes(b'tampered')
             check(c.api('update-restore', {'id': b})[0] == 400, 'corrupt backup cannot be restored'); bad.write_bytes(old)
             pruned = c.api('update-info')[1]['backups'][1]['id']
             check(c.api('update-backup-limit', {'keep': 1})[0] == 200, 'retention policy saved')

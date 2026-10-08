@@ -98,7 +98,7 @@ class Client:
         return response.code, json.loads(response.read())
 
     def dav(self, method, name='', body=None, headers=None, **kwargs):
-        path = '/dav.php/' + urllib.parse.quote(name, safe='/')
+        path = '/index.php/' + urllib.parse.quote(name, safe='/')
         return self.call(method, path, body, headers, **kwargs)
 
 
@@ -125,8 +125,12 @@ def suite(client, state):
     check(client.dav('MKCOL', 'cookie-ok', headers={'Cookie': client.cookie(), 'X-CSRF-Token': client.csrf},
                      auth=False)[0] == 201, 'session DAV mutation with CSRF')
     check(client.dav('OPTIONS')[0] == 200, 'DAV OPTIONS')
-    check(client.call('PROPFIND', '/index.php/dav/', headers={'Depth': '0'})[0] == 404,
-          'management PHP path is not a DAV alias')
+    check(client.call('PROPFIND', '/dav.php/', headers={'Depth': '0'})[0] == 404,
+          'former DAV entry is not an alias')
+    check(client.call('PROPFIND', '/index.php/', headers={'Depth': '0'})[0] == 207,
+          'single PHP entry serves DAV root')
+    check('class="file-browser"' in client.call('GET', '/index.php', headers={'Cookie': client.cookie()}, auth=False)[2].decode(),
+          'same PHP entry serves management page without PATH_INFO')
     check(client.call('PROPFIND', '/dav/', headers={'Depth': '0'})[0] == 404,
           'extensionless path is not a DAV alias')
 
@@ -172,26 +176,26 @@ def suite(client, state):
     code, _, xml = client.dav('PROPFIND', 'source', headers={'Depth': '1'})
     tree = ET.fromstring(xml)
     check(code == 207 and len(tree.findall('{DAV:}response')) == 2, 'Depth 1 PROPFIND')
-    check(client.dav('COPY', 'source/sample.bin', headers={'Destination': client.base + '/dav.php/target/copy.bin'})[0] == 201,
+    check(client.dav('COPY', 'source/sample.bin', headers={'Destination': client.base + '/index.php/target/copy.bin'})[0] == 201,
           'COPY')
     check(client.dav('GET', 'target/copy.bin')[2] == content[::-1], 'COPY preserves content')
     inode = (state / 'files/source/sample.bin').stat().st_ino
-    check(client.dav('MOVE', 'source/sample.bin', headers={'Destination': client.base + '/dav.php/target/moved.bin'})[0] == 201,
+    check(client.dav('MOVE', 'source/sample.bin', headers={'Destination': client.base + '/index.php/target/moved.bin'})[0] == 201,
           'cross-directory MOVE')
     check((state / 'files/target/moved.bin').stat().st_ino == inode, 'MOVE uses native rename')
     check(client.dav('GET', 'source/sample.bin')[0] == 404, 'MOVE removes source')
-    check(client.dav('MOVE', 'target/moved.bin', headers={'Destination': client.base + '/dav.php/target/renamed.bin'})[0] == 201,
+    check(client.dav('MOVE', 'target/moved.bin', headers={'Destination': client.base + '/index.php/target/renamed.bin'})[0] == 201,
           'same-directory rename')
     check(client.dav('PUT', 'source/nested', b'x')[0] == 201, 'create nested file')
     inode = (state / 'files/source/nested').stat().st_ino
-    check(client.dav('MOVE', 'source', headers={'Destination': client.base + '/dav.php/target/subtree'})[0] == 201,
+    check(client.dav('MOVE', 'source', headers={'Destination': client.base + '/index.php/target/subtree'})[0] == 201,
           'directory MOVE')
     check((state / 'files/target/subtree/nested').stat().st_ino == inode, 'directory MOVE avoids recursive copy')
     check(client.dav('DELETE', 'target/subtree')[0] == 204, 'recursive DELETE')
     check(client.dav('DELETE')[0] == 403, 'root cannot be deleted')
     check(client.dav('PUT', '.dav-upload-reserved', b'x')[0] == 403, 'reserved name rejected')
     check(client.dav('PUT', 'bad\\name', b'x')[0] == 403, 'backslash path rejected')
-    check(client.call('GET', '/dav.php/%2e%2e/config.json')[0] in (403, 404), 'traversal rejected')
+    check(client.call('GET', '/index.php/%2e%2e/config.json')[0] in (403, 404), 'traversal rejected')
     outside = state / 'secret.txt'
     outside.write_text('outside-secret')
     (state / 'files/escape').symlink_to(outside)
@@ -230,7 +234,7 @@ def suite(client, state):
     client.dav('PUT', 'interrupted', b'original')
     if client.parsed.scheme == 'http':
         connection = socket.create_connection((client.parsed.hostname, client.parsed.port), timeout=5)
-        message = (f'PUT /dav.php/interrupted HTTP/1.1\r\nHost: {client.parsed.netloc}\r\n'
+        message = (f'PUT /index.php/interrupted HTTP/1.1\r\nHost: {client.parsed.netloc}\r\n'
                    f'Authorization: {client.auth()}\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n').encode()
         connection.sendall(message + b'partial')
         connection.shutdown(socket.SHUT_WR)
@@ -386,13 +390,13 @@ def quota_check(client, state):
     check(client.dav('PUT', 'quota-one', b'123456789')[0] == 507, 'oversized replacement rejected')
     check(client.dav('GET', 'quota-one')[2] == b'123456', 'failed replacement preserves old data')
     check(client.dav('PUT', 'quota-two', b'ab')[0] == 201, 'replacement releases net capacity')
-    check(client.dav('COPY', 'quota-one', headers={'Destination': client.base + '/dav.php/quota-copy'})[0] == 507,
+    check(client.dav('COPY', 'quota-one', headers={'Destination': client.base + '/index.php/quota-copy'})[0] == 507,
           'COPY obeys capacity limit')
-    check(client.dav('COPY', 'quota-one', headers={'Destination': client.base + '/dav.php/quota-two'})[0] == 507,
+    check(client.dav('COPY', 'quota-one', headers={'Destination': client.base + '/index.php/quota-two'})[0] == 507,
           'COPY replacement checks net growth before removing old target')
     check(client.dav('GET', 'quota-two')[2] == b'ab', 'over-quota COPY preserves old target')
     client.dav('MKCOL', 'quota-dir')
-    check(client.dav('MOVE', 'quota-one', headers={'Destination': client.base + '/dav.php/quota-dir/moved'})[0] == 201,
+    check(client.dav('MOVE', 'quota-one', headers={'Destination': client.base + '/index.php/quota-dir/moved'})[0] == 201,
           'MOVE works at full quota')
     check(client.api('storage')[1]['used_bytes'] == limit, 'MOVE does not increase accounted bytes')
     client.dav('DELETE', 'quota-two')
@@ -405,7 +409,7 @@ def quota_check(client, state):
         client.dav('DELETE', name)
     check(client.api('storage')[1]['used_bytes'] == used, 'recursive DELETE returns usage to baseline')
     client.dav('PUT', 'quota-copy-source', b'abc');client.dav('PUT', 'quota-copy-target', b'x')
-    check(client.dav('COPY', 'quota-copy-source', headers={'Destination': client.base + '/dav.php/quota-copy-target'})[0] == 204,
+    check(client.dav('COPY', 'quota-copy-source', headers={'Destination': client.base + '/index.php/quota-copy-target'})[0] == 204,
           'COPY replacement within quota succeeds')
     check(client.dav('GET', 'quota-copy-target')[2] == b'abc' and client.api('storage')[1]['used_bytes'] == used + 6,
           'COPY replacement accounts for new and old sizes')
@@ -439,12 +443,12 @@ def quota_check(client, state):
     client.api('upload-cancel', {'id': job['id']});client.dav('DELETE', 'quota-chunks')
 
     connection = client.connection()
-    connection.request('PUT', '/dav.php/quota-unknown', body=iter([b'ab', b'cd']),
+    connection.request('PUT', '/index.php/quota-unknown', body=iter([b'ab', b'cd']),
                        headers={'Authorization': client.auth()}, encode_chunked=True)
     response = connection.getresponse(); status = response.status; response.read();connection.close()
     check(status == 201 and client.dav('GET', 'quota-unknown')[2] == b'abcd', 'unknown-length PUT works within quota')
     connection = client.connection()
-    connection.request('PUT', '/dav.php/quota-unknown-over', body=iter([b'abc', b'def']),
+    connection.request('PUT', '/index.php/quota-unknown-over', body=iter([b'abc', b'def']),
                        headers={'Authorization': client.auth()}, encode_chunked=True)
     response = connection.getresponse(); status = response.status; response.read();connection.close()
     check(status == 507 and client.dav('GET', 'quota-unknown-over')[0] == 404, 'unknown-length PUT bounded by remaining capacity')
@@ -494,7 +498,7 @@ def benchmark(client, state):
         check(code == 201, 'large upload')
     start = time.perf_counter()
     connection = client.connection()
-    connection.request('GET', '/dav.php/large.bin', headers={'Authorization': client.auth()})
+    connection.request('GET', '/index.php/large.bin', headers={'Authorization': client.auth()})
     response = connection.getresponse()
     result = hashlib.sha256()
     length = 0
@@ -544,7 +548,7 @@ def rclone_check(client):
                 handle.write(block)
         obscured = subprocess.check_output(['rclone', 'obscure', '-'], input=(client.password + '\n').encode()).decode().strip()
         conf = root / 'rclone.conf'
-        conf.write_text(f'[private]\ntype = webdav\nurl = {client.base}/dav.php/\nvendor = other\nuser = {USER}\npass = {obscured}\n')
+        conf.write_text(f'[private]\ntype = webdav\nurl = {client.base}/index.php/\nvendor = other\nuser = {USER}\npass = {obscured}\n')
         conf.chmod(0o600)
         prefix = ['rclone', '--config', str(conf), '--log-level', 'ERROR']
         commands = [

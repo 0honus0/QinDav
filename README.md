@@ -1,6 +1,6 @@
 # QinDav
 
-基于 **sabre/dav 4.7** 的单用户 WebDAV 应用，应用逻辑集中在 `index.php`，`dav.php` 是独立 WebDAV 入口。
+基于 **sabre/dav 4.7** 的单用户 WebDAV 应用，管理界面与 WebDAV 共用唯一入口 `index.php`，运行依赖放在 `vendor/`。
 不使用数据库。Composer 依赖、运行配置、会话、锁信息和用户文件仍然是独立文件。
 
 ## 已实现
@@ -28,7 +28,7 @@ WEBDAV_STATE_DIR=/tmp/my-webdav php -S 127.0.0.1:8080 tools/router.php
 ```
 
 打开 `http://127.0.0.1:8080/` 创建账号。WebDAV 地址为
-`http://127.0.0.1:8080/dav.php/`。开发服务器仅适合本机体验，不用于生产或性能评估。
+`http://127.0.0.1:8080/index.php/`。开发服务器仅适合本机体验，不用于生产或性能评估。
 
 状态目录必须在应用目录以外，PHP 用户需有读写权限。未设置时使用应用父目录下
 `.webdav-state-<应用路径指纹>`。目录结构如下：
@@ -56,16 +56,24 @@ update-*.json    版本检查缓存、备份保留策略及中断恢复日志
 python3 tools/build.py
 ```
 
-生成 `dist/QinDav.zip`，包含 `index.php`、`dav.php` 和 `vendor/`，依赖已包含，
+生成 `dist/QinDav.zip`，包含 `index.php` 和 `vendor/`，依赖已包含，
 服务器无需运行 Composer。将包内容解压到已支持 PHP 的网站根目录，访问域名创建账号即可。
 升级时覆盖同一应用目录，保留网站目录之外的状态目录。
 `dist/SHA256SUMS` 提供文件完整性校验。
 
 ## 主机部署与性能
 
-复制 `index.php`、`dav.php` 和 `vendor/` 到网站目录。管理页面地址为域名根路径，
-WebDAV 唯一地址为 `https://你的域名/dav.php/`。前置服务需支持 PHP PATH_INFO，
-即 `/dav.php/文件名` 由实际的 `dav.php` 执行。包内没有服务器配置或重写规则。
+复制 `index.php` 和 `vendor/` 到网站目录。管理页面地址为域名根路径，
+WebDAV 唯一地址为 `https://你的域名/index.php/`。前置服务需支持 PHP PATH_INFO，
+即 `/index.php/文件名` 由实际的 `index.php` 执行。包内没有服务器配置或重写规则。
+
+从 v1.2.0 或更早版本升级到 v1.3.0 时，请手动覆盖压缩包并删除旧的 `dav.php`，
+将客户端连接地址改为 `/index.php/`。旧版更新器要求压缩包含 `dav.php`，无法直接安装
+新版单入口包；此次手动升级保留原路径下的账号、设置、文件与备份。后续版本可继续自更新。
+
+回退到 v1.2.0 或更早版本的已有备份时，会恢复旧版 `dav.php` 与旧连接地址。
+旧版更新器不能恢复新版单入口备份，需要再次手动覆盖新版包。
+
 不需要数据库，不需要在主机上运行 Composer。要求 64 位 PHP 8.2+、DOM/XML、mbstring。
 
 状态目录仍位于站点根目录之外；PHP 用户需具有读写权限，且该目录在 open_basedir
@@ -113,16 +121,15 @@ WebDAV 唯一地址为 `https://你的域名/dav.php/`。前置服务需支持 P
 
 ## rclone
 
-WebDAV 地址固定为 `/dav.php/`，由独立的 `dav.php` 处理。
-`index.php` 只处理管理页面，没有其他 WebDAV 地址别名。
+WebDAV 地址固定为 `/index.php/`，与管理页面共用 `index.php`，没有其他 WebDAV 地址别名。
 
-使用 `rclone config` 创建 remote，选择 `webdav`，URL 为 `https://你的域名/dav.php/`，
+使用 `rclone config` 创建 remote，选择 `webdav`，URL 为 `https://你的域名/index.php/`，
 vendor 选择 `other`，输入管理员用户名和应用密码。
 
 ```ini
 [private]
 type = webdav
-url = https://你的域名/dav.php/
+url = https://你的域名/index.php/
 vendor = other
 user = admin
 pass = <由 rclone config 保存的 obscured 密码>
@@ -227,7 +234,7 @@ git push origin v1.0.0
 ```
 
 用户部署时下载 Release 中的 `QinDav.zip`，无需安装 Composer、Node 或测试工具。
-压缩包仅包含 `index.php`、`dav.php` 和 `vendor/`。
+压缩包仅包含 `index.php` 和 `vendor/`。
 
 ## 应用内更新与回退
 
@@ -242,7 +249,7 @@ PHP 通过验证证书的 HTTPS 下载部署包及 `SHA256SUMS`，检查 SHA-256
 替换阶段暂停接收新请求，已进入 PHP 的上传或下载不会被替换动作打断。
 前置服务接管的下载不受 PHP 锁协调，但其用户文件不会被程序更新改动。
 
-更新与回退只替换 `index.php`、`dav.php` 和 `vendor/`。账号、应用密码、容量设置和用户文件
+更新与回退只替换 `index.php` 和 `vendor/`。账号、应用密码、容量设置和用户文件
 留在状态目录，回退不会恢复或删除用户数据。目录替换失败自动恢复旧程序；PHP 进程在
 替换中断后，下次请求会先处理恢复日志，再加载依赖，恢复完成时请重试请求。
 

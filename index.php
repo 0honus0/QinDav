@@ -1,13 +1,13 @@
 <?php
 declare(strict_types=1);
 
-// Application logic lives here; dav.php is the dedicated WebDAV entry point.
+// Single application entry: management page and WebDAV share index.php.
 // Runtime state and uploaded files live outside the web root.
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.2.0';
+const QINDAV_VERSION = '1.3.0';
 try { $applicationLock = applicationGate(); } catch (Throwable $error) {
     error_log('QinDav bootstrap: ' . $error->getMessage());
     http_response_code(503);
@@ -1082,7 +1082,7 @@ function updateExtract(string $archive, string $destination, string $version): v
             $parts = explode('/', rtrim($name, '/'));
             if (isset($seen[$name]) || preg_match('/[\x00-\x1f\x7f\\\\]/', $name) || in_array('', $parts, true)
                 || in_array('..', $parts, true) || in_array('.', $parts, true)
-                || !(in_array($name, ['index.php', 'dav.php'], true) || str_starts_with($name, 'vendor/'))) {
+                || !($name === 'index.php' || str_starts_with($name, 'vendor/'))) {
                 throw new InvalidArgumentException('更新包包含非法路径');
             }
             $seen[$name] = true;
@@ -1094,7 +1094,7 @@ function updateExtract(string $archive, string $destination, string $version): v
             $total += $stat['size'];
             if ($total > 64 * 1024 * 1024) throw new InvalidArgumentException('更新包解压大小超限');
         }
-        foreach (['index.php', 'dav.php', 'vendor/autoload.php', 'vendor/composer/autoload_real.php'] as $required) {
+        foreach (['index.php', 'vendor/autoload.php', 'vendor/composer/autoload_real.php'] as $required) {
             if (!isset($seen[$required])) throw new InvalidArgumentException('更新包缺少必要程序文件');
         }
         $source = $zip->getFromName('index.php');
@@ -1142,6 +1142,8 @@ function updateSnapshotHash(string $root): string
         $path = $root . '/' . $name;
         if (is_link($path)) throw new InvalidArgumentException('程序快照包含符号链接');
         if (is_file($path)) { $files[$name] = $path; continue; }
+        // Legacy backups may contain the former DAV entry; include it only when present.
+        if ($name === 'dav.php' && !file_exists($path)) continue;
         if (!is_dir($path)) throw new InvalidArgumentException('程序快照缺少必要文件');
         $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
         foreach ($iterator as $entry) {
@@ -1221,6 +1223,10 @@ function updatePublish(string $jobName, string $sessionEpoch, string $version): 
                     if (!copy($live, $backup . '.tmp') || !rename($backup . '.tmp', $backup)) throw new RuntimeException('Cannot back up ' . $name);
                 }
             }
+            if ($name === 'dav.php' && !file_exists($job . '/new/' . $name)) {
+                updateRemove($live); // Remove the former entry when publishing a single-entry snapshot.
+                continue;
+            }
             if (!rename($job . '/new/' . $name, $live)) throw new RuntimeException('Cannot publish ' . $name);
         }
         updateInvalidate();
@@ -1294,7 +1300,11 @@ function restoreUpdate(string $backupId, string $sessionEpoch): array
         if (($backup['fingerprint'] ?? '') === updateSnapshotHash(__DIR__)) throw new DAV\Exception\Conflict('当前程序与此备份完全相同，无需回退');
         if (($backup['fingerprint'] ?? '') !== updateSnapshotHash(stateDir() . '/updates/' . $backupId . '/old')) throw new InvalidArgumentException('备份内容校验失败，不能回退');
         if (!mkdir($job . '/new', 0700, true) || !mkdir($job . '/old', 0700)) throw new RuntimeException('Cannot prepare restore');
-        foreach (['vendor', 'dav.php', 'index.php'] as $name) updateCopy(stateDir() . '/updates/' . $backupId . '/old/' . $name, $job . '/new/' . $name);
+        foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+            $source = stateDir() . '/updates/' . $backupId . '/old/' . $name;
+            if ($name === 'dav.php' && !file_exists($source)) continue;
+            updateCopy($source, $job . '/new/' . $name);
+        }
         return updatePublish($jobName, $sessionEpoch, $backup['version']);
     } finally {
         $retained = in_array($jobName, array_column(updateBackups()['backups'], 'id'), true)
@@ -1418,12 +1428,8 @@ function html(string $value): string { return htmlspecialchars($value, ENT_QUOTE
 try {
     $cfg = config();
     $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-    $davBase = '/dav.php/';
-    if (defined('QINGDAV_DAV_ENTRY')) {
-        if ($uri !== '/dav.php' && !str_starts_with($uri, $davBase)) {
-            http_response_code(404);
-            exit('Not found');
-        }
+    $davBase = '/index.php/';
+    if (str_starts_with($uri, $davBase)) {
         serveDav($cfg, $davBase);
     }
     if (!in_array($uri, ['/', '/index.php'], true)) {

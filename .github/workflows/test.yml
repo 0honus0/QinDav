@@ -38,7 +38,6 @@ jobs:
       - name: Check PHP syntax
         run: |
           php -l index.php
-          php -l dav.php
           php -l tools/router.php
       - name: Protocol, quota and rclone tests
         run: python3 tests/integration.py --rclone

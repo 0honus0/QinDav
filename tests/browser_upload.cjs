@@ -18,7 +18,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
    }finally{active--;}
   }else if(u.searchParams.get('api')==='upload-finish'&&!lostFinish){
    lostFinish=true;const response=await route.fetch();assert.equal(response.status(),200);await route.fulfill({status:503,contentType:'application/json',body:'{"error":"simulated lost acknowledgement"}'});
-  }else{if(req.method()==='PUT'&&u.pathname.startsWith('/dav.php/'))direct++;await route.continue();}
+  }else{if(req.method()==='PUT'&&u.pathname.startsWith('/index.php/'))direct++;await route.continue();}
  });
  const paths=['big-one.bin','big-two.bin','small.txt'].map(n=>process.env.FIXTURE_DIR+'/'+n);
  await page.locator('#files').setInputFiles(paths);
