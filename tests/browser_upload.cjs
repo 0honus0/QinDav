@@ -128,7 +128,33 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.setViewportSize({width:390,height:844});await page.screenshot({path:'/tmp/qingdav-h5ai-mobile.png',fullPage:true});
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'mobile layout does not overflow');
  listRect=await page.locator('#file-list').boundingBox();assert.ok(listRect.height/844>.7,'file list owns mobile viewport');
+ // A search field must never share the same cramped row as the mobile action buttons.
+ const mobileMetrics=async width=>{
+  const box=await page.evaluate(()=>{
+   const rect=selector=>{const {left,right,top,bottom,width}=document.querySelector(selector).getBoundingClientRect();return {left,right,top,bottom,width};};
+   return {search:rect('#filter'),tools:rect('.browser-tools .tools'),list:rect('#file-list'),viewport:innerWidth};
+  });
+  assert.equal(box.viewport,width);
+  assert.ok(box.search.width>=width-32,'mobile search input remains readable: '+JSON.stringify(box));
+  assert.ok(box.tools.top>=box.search.bottom-1,'mobile actions do not squeeze the search input');
+  assert.ok(Math.abs(box.list.left)<=1&&Math.abs(box.list.right-width)<=1,'mobile list reaches both screen edges: '+JSON.stringify(box));
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile document does not overflow');
+ };
+ await mobileMetrics(390);
+ await page.locator('#rows .filename').filter({hasText:'Documents'}).click();
+ await page.waitForFunction(()=>path==='Documents'&&!loading);
+ await mobileMetrics(390);
+ assert.ok((await page.locator('#file-list table').boundingBox()).width>=389,'short folder table fills mobile screen');
+ await page.getByRole('button',{name:'返回上级目录'}).click();
+ await page.waitForFunction(()=>path===''&&!loading);
  await page.setViewportSize({width:320,height:640});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'narrow mobile does not overflow');
+ await mobileMetrics(320);
+ await page.locator('#rows .filename').filter({hasText:'Documents'}).click();
+ await page.waitForFunction(()=>path==='Documents'&&!loading);
+ await mobileMetrics(320);
+ assert.ok((await page.locator('#file-list table').boundingBox()).width>=319,'short folder table fills narrow mobile screen');
+ await page.getByRole('button',{name:'返回上级目录'}).click();
+ await page.waitForFunction(()=>path===''&&!loading);
  await page.setViewportSize({width:390,height:844});
  await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-mobile.png'});
  assert.equal(await page.locator('#settings').evaluate(el=>el.getBoundingClientRect().left>=0&&el.getBoundingClientRect().right<=innerWidth),true,'settings fit on mobile');

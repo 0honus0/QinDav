@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.6';
+const QINDAV_VERSION = '1.4.7';
 const PERFORMANCE_LOG_ENABLED = true;
 const PERFORMANCE_LOG_MAX_BYTES = 2 * 1024 * 1024;
 // Keep only baseline timestamps until the existing configuration read decides whether to log.
@@ -1999,6 +1999,16 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
 @media(max-width:700px){.app main{padding:0 12px}.app header{height:48px}.app .browser-bar{flex-direction:column;align-items:stretch;padding:6px 0 8px;gap:6px}.app .crumb{flex:none;width:100%;min-height:28px}.browser-tools{gap:6px;width:100%}.app .filter{width:auto;flex:1;min-width:80px}.app .filter input{font-size:12px;padding-right:6px}.app .browser-tools .tools{gap:4px;flex-shrink:0}.app .browser-tools button{padding:6px 7px;font-size:12px}.app th:nth-child(2){width:68px}.app th.actions{width:76px}.app td{padding:6px 5px;height:44px}.app .name{gap:7px;font-size:12px}.app .row-actions button{min-width:34px;min-height:34px;padding:7px}.app .pager{gap:5px;min-height:40px}.app .pager button{padding:6px;font-size:11px}.app .pager .info{font-size:11px}.app .file-icon{width:20px;height:23px}}
 .upload-panel{flex-shrink:0;border:1px solid #dce8f0;border-radius:10px;background:#f7fbfe;padding:12px 16px;margin-bottom:10px}.upload-summary,.upload-detail{display:flex;justify-content:space-between;gap:16px}.upload-summary{font-size:13px}.upload-summary strong{font-weight:500}.upload-summary-actions{display:flex;align-items:center;gap:12px}#upload-close{padding:0;border:0;line-height:1;font-size:19px}#upload-close[hidden]{display:none}.upload-detail{font-size:12px;color:#748593}.upload-panel progress{display:block;width:100%;height:6px;border:0;border-radius:8px;overflow:hidden;accent-color:var(--accent);margin:9px 0;background:#e4edf3}.upload-panel progress::-webkit-progress-bar{background:#e4edf3}.upload-panel progress::-webkit-progress-value{background:var(--accent);border-radius:8px;transition:width .15s}.upload-panel progress::-moz-progress-bar{background:var(--accent)}#upload-current{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.action-dialog{border:1px solid #e5ebf0;border-radius:16px;width:min(420px,calc(100vw - 32px));padding:26px;box-shadow:0 22px 80px #23384930;color:var(--ink)}.action-dialog::backdrop{background:#28374655;backdrop-filter:blur(3px)}.action-dialog h2{font-size:19px;margin:14px 0 8px}.action-dialog p{color:#73808b;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 20px}.action-dialog input{width:100%}.action-symbol{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:#eaf4fc;color:var(--accent);font-size:22px}.action-dialog.danger .action-symbol{color:#c05c5c;background:#fcEEEE}.action-dialog.danger #action-submit{background:#be5d5d;border-color:#be5d5d}.action-controls{display:flex;justify-content:flex-end;gap:8px;margin-top:22px}.action-dialog label[hidden],.upload-panel[hidden]{display:none}@media(max-width:700px){.app .browser-tools .tools{flex-wrap:wrap;flex-shrink:1;min-width:0;justify-content:flex-end}.upload-panel{padding:10px 12px}.upload-detail{gap:8px;flex-wrap:wrap}}
 .performance-toggle{display:flex;align-items:center;gap:8px;margin:12px 0}.performance-toggle input{width:auto;margin:0}.performance-output{width:100%;border:1px solid #dce3e8;border-radius:6px;padding:12px;background:#f8fafc;color:var(--ink);font:12px/1.65 ui-monospace,monospace;resize:vertical}.performance-output[hidden]{display:none}
+/* Narrow screens: keep search readable and let file rows use the full viewport, even in short folders. */
+@media(max-width:700px){
+  .app .browser-tools{flex-direction:column;align-items:stretch;gap:8px}
+  .app .filter{width:100%;flex:none;min-width:0}
+  .app .filter input{font-size:13px;min-height:36px;padding:8px 10px 8px 32px}
+  .app .browser-tools .tools{width:100%;flex-shrink:0;justify-content:flex-start;gap:6px}
+  .app .table-wrap{width:calc(100% + 24px);margin-inline:-12px;scrollbar-gutter:auto}
+  .app th:first-child,.app td:first-child{padding-left:12px}
+  .app th.actions,.app td.actions{padding-right:12px}
+}
 </style>
 <body<?= $loggedIn ? ' class="app"' : '' ?>>
 <main>
