@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.0';
+const QINDAV_VERSION = '1.4.1';
 try { $applicationLock = applicationGate(); } catch (Throwable $error) {
     error_log('QinDav bootstrap: ' . $error->getMessage());
     http_response_code(503);
@@ -335,6 +335,7 @@ function writeStream(string $destination, mixed $data, bool $createOnly = false)
     $output = fopen($tmp, 'xb');
     if ($output === false) throw new DAV\Exception\InsufficientStorage('Cannot create upload');
     $id = basename($tmp);
+    $reserved = false;
     try {
         if ($data === null) $data = '';
         $expected = is_resource($data) ? null : strlen((string) $data);
@@ -344,6 +345,7 @@ function writeStream(string $destination, mixed $data, bool $createOnly = false)
             if ($stat !== false) $expected = max(0, $stat['size'] - ftell($data));
         }
         $maximum = reserveStorage($id, $expected, $destination);
+        $reserved = true;
         $bytes = is_resource($data)
             ? ($maximum === null ? stream_copy_to_stream($data, $output) : stream_copy_to_stream($data, $output, $maximum + 1))
             : fwrite($output, (string) $data);
@@ -360,12 +362,14 @@ function writeStream(string $destination, mixed $data, bool $createOnly = false)
             if ($createOnly && file_exists($destination)) throw new DAV\Exception\PreconditionFailed('Destination already exists');
             if (!rename($tmp, $destination)) throw new DAV\Exception\InsufficientStorage('Cannot commit upload');
         });
+        // Publication already removes the reservation in the same accounting transaction.
+        $reserved = false;
         clearstatcache(true, $destination);
         return (new FastFile($destination))->getETag();
     } finally {
         if (is_resource($output)) fclose($output);
         if (is_file($tmp)) unlink($tmp);
-        releaseStorage($id);
+        if ($reserved) releaseStorage($id);
     }
 }
 
