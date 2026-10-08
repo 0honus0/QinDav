@@ -1,0 +1,13 @@
+/vendor/
+/.webdav-state/
+/.phpunit.cache/
+__pycache__/
+*.pyc
+/dist/
+/node_modules/
+/docs/
+/tests/remote_benchmark.py
+/.webdav-state-*/
+.env
+.env.*
+*.log

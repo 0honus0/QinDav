@@ -1,0 +1,7 @@
+{
+  "name": "qindav-tests",
+  "private": true,
+  "description": "Browser test dependencies only; not included in the PHP deployment package",
+  "scripts": { "test": "python3 tests/browser_upload.py" },
+  "devDependencies": { "playwright": "1.64.0" }
+}

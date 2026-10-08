@@ -1,0 +1,12 @@
+{
+  "name": "local/single-file-webdav",
+  "description": "Single-user, database-free WebDAV with a single PHP application entry point",
+  "type": "project",
+  "require": {
+    "php": ">=8.2",
+    "ext-dom": "*",
+    "ext-mbstring": "*",
+    "sabre/dav": "^4.7"
+  },
+  "config": { "sort-packages": true, "optimize-autoloader": true }
+}
