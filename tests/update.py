@@ -19,6 +19,7 @@ from integration import Client, PASSWORD, USER
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKS = 0
+OPCACHE = os.environ.get("QINDAV_TEST_OPCACHE") == "1"
 
 
 def check(ok, message):
@@ -78,7 +79,9 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
            'PHP_CLI_SERVER_WORKERS': '4'}
     env.pop('WEBDAV_SETUP_TOKEN', None); env.pop('WEBDAV_ACCEL_PREFIX', None)
     with (tmp / 'server.log').open('w+') as log:
-        process = subprocess.Popen(['php', '-d', 'memory_limit=128M', '-d', 'opcache.enable_cli=0', '-S', f'127.0.0.1:{port}', 'tools/router.php'],
+        process = subprocess.Popen(['php', '-d', 'memory_limit=128M', '-d', f'opcache.enable_cli={int(OPCACHE)}',
+                                    '-d', 'opcache.validate_timestamps=0', '-d', 'opcache.file_update_protection=0',
+                                    '-S', f'127.0.0.1:{port}', 'tools/router.php'],
                                    cwd=app, env=env, stdout=log, stderr=log, start_new_session=True)
         try:
             base = f'http://127.0.0.1:{port}'
@@ -130,17 +133,18 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             fixture('1.2.0', invalid_version=True)
             check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'archive version mismatch rejected')
             check(c.api('update-info')[1]['current'] == '1.1.0', 'validation failures preserve old code')
-            # Direct fixture edits bypass the updater's OPcache invalidation; this server disables CLI OPcache.
-            # Inject a publication failure in the disposable copy, after vendor replacement.
-            before_fault = (app / 'index.php').read_text()
-            broken = before_fault.replace("if (!rename($job . '/new/' . $name, $live))", "if ($name === 'dav.php' || !rename($job . '/new/' . $name, $live))")
-            check(broken != before_fault, 'publication failure hook injected in test copy only')
-            (app / 'index.php').write_text(broken)
-            fixture('1.2.0')
-            check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'partial publication failure rolls back')
-            check((app / 'index.php').read_text() == broken and (app / 'vendor/autoload.php').is_file(), 'all old entries restored')
-            check(c.api('update-info')[1]['backups'] == [], 'failed swap not recorded as backup')
-            (app / 'index.php').write_text(before_fault)
+            if not OPCACHE:
+                # Direct fixture edits bypass the updater's OPcache invalidation; this server disables CLI OPcache.
+                # Inject a publication failure in the disposable copy, after vendor replacement.
+                before_fault = (app / 'index.php').read_text()
+                broken = before_fault.replace("if (!rename($job . '/new/' . $name, $live))", "if ($name === 'dav.php' || !rename($job . '/new/' . $name, $live))")
+                check(broken != before_fault, 'publication failure hook injected in test copy only')
+                (app / 'index.php').write_text(broken)
+                fixture('1.2.0')
+                check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'partial publication failure rolls back')
+                check((app / 'index.php').read_text() == broken and (app / 'vendor/autoload.php').is_file(), 'all old entries restored')
+                check(c.api('update-info')[1]['backups'] == [], 'failed swap not recorded as backup')
+                (app / 'index.php').write_text(before_fault)
             fixture('1.2.0')
             check(c.api('update-install', {'version': '1.3.0'})[0] == 409, 'changed release requires confirmation again')
             check(c.api('update-install', {'version': '1.2.0'})[0] == 200, 'update installed')
@@ -185,33 +189,34 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             check(c.api('update-info')[1]['current'] == '1.1.0', 'recovered instance works')
             check(c.dav('GET', 'preserved.txt')[2] == b'keep this data', 'crash recovery preserves user data')
 
-            # A committed swap must complete backup bookkeeping, rather than roll back.
-            job_id = 'job-' + 'b' * 24; job = state / 'updates' / job_id
-            (job / 'old').mkdir(parents=True); (job / 'new').mkdir()
-            snapshot_files = {}
-            for name in ['index.php', 'dav.php', 'vendor']:
-                src = app / name; dst = job / 'old' / name
-                if src.is_dir():
-                    shutil.copytree(src, dst)
-                    for path in src.rglob('*'):
-                        if path.is_file(): snapshot_files[path.relative_to(app).as_posix()] = path
-                else:
-                    shutil.copy(src, dst); snapshot_files[name] = src
-            fingerprint = hashlib.sha256()
-            for name, path in sorted(snapshot_files.items()):
-                fingerprint.update((name + '\0' + hashlib.sha256(path.read_bytes()).hexdigest() + '\n').encode())
-            active = (app / 'index.php').read_text().replace("const QINDAV_VERSION = '1.1.0';", "const QINDAV_VERSION = '1.3.0';")
-            (app / 'index.php').write_text(active)
-            journal = {'job': job_id, 'committed': True, 'existed': {'vendor': True, 'dav.php': True, 'index.php': True},
-                       'previous_version': '1.1.0', 'created_at': int(time.time()), 'fingerprint': fingerprint.hexdigest()}
-            (state / 'update-journal.json').write_text(json.dumps(journal))
-            check(c.call('GET', '/', auth=False)[0] == 503, 'committed journal housekeeping completed on bootstrap')
-            info = c.api('update-info')[1]
-            check(info['current'] == '1.3.0', 'committed new version not rolled back')
-            check(len(info['backups']) == 1 and info['backups'][0]['version'] == '1.1.0', 'committed backup indexed and retention enforced')
-            check(c.dav('GET', 'preserved.txt')[2] == b'keep this data', 'committed recovery preserves data')
+            if not OPCACHE:
+                # A committed swap must complete backup bookkeeping, rather than roll back.
+                job_id = 'job-' + 'b' * 24; job = state / 'updates' / job_id
+                (job / 'old').mkdir(parents=True); (job / 'new').mkdir()
+                snapshot_files = {}
+                for name in ['index.php', 'dav.php', 'vendor']:
+                    src = app / name; dst = job / 'old' / name
+                    if src.is_dir():
+                        shutil.copytree(src, dst)
+                        for path in src.rglob('*'):
+                            if path.is_file(): snapshot_files[path.relative_to(app).as_posix()] = path
+                    else:
+                        shutil.copy(src, dst); snapshot_files[name] = src
+                fingerprint = hashlib.sha256()
+                for name, path in sorted(snapshot_files.items()):
+                    fingerprint.update((name + '\0' + hashlib.sha256(path.read_bytes()).hexdigest() + '\n').encode())
+                active = (app / 'index.php').read_text().replace("const QINDAV_VERSION = '1.1.0';", "const QINDAV_VERSION = '1.3.0';")
+                (app / 'index.php').write_text(active)
+                journal = {'job': job_id, 'committed': True, 'existed': {'vendor': True, 'dav.php': True, 'index.php': True},
+                           'previous_version': '1.1.0', 'created_at': int(time.time()), 'fingerprint': fingerprint.hexdigest()}
+                (state / 'update-journal.json').write_text(json.dumps(journal))
+                check(c.call('GET', '/', auth=False)[0] == 503, 'committed journal housekeeping completed on bootstrap')
+                info = c.api('update-info')[1]
+                check(info['current'] == '1.3.0', 'committed new version not rolled back')
+                check(len(info['backups']) == 1 and info['backups'][0]['version'] == '1.1.0', 'committed backup indexed and retention enforced')
+                check(c.dav('GET', 'preserved.txt')[2] == b'keep this data', 'committed recovery preserves data')
 
-            print(f'PASS: {CHECKS} update/rollback assertions; transport mocked, real archive and filesystem swaps')
+            print(f'PASS: {CHECKS} update/rollback assertions; OPcache={OPCACHE}, transport mocked, real archive and filesystem swaps')
         except Exception:
             log.seek(0); print(log.read()[-6000:]); raise
         finally:

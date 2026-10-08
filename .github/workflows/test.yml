@@ -43,7 +43,9 @@ jobs:
       - name: Protocol, quota and rclone tests
         run: python3 tests/integration.py --rclone
       - name: Update and rollback tests
-        run: python3 tests/update.py
+        run: |
+          python3 tests/update.py
+          QINDAV_TEST_OPCACHE=1 python3 tests/update.py
       - uses: actions/setup-node@v4
         if: matrix.php == '8.4'
         with:

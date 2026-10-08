@@ -191,6 +191,8 @@ composer install --no-dev --optimize-autoloader
 python3 tests/integration.py --rclone
 # 更新、回退、去重、校验与中断恢复；使用临时实例及本地下载夹具
 python3 tests/update.py
+# 开启 OPcache 且关闭时间戳检查，验证更新与回退主动清除程序缓存
+QINDAV_TEST_OPCACHE=1 python3 tests/update.py
 # 可选本地回环基准；不代表公网吞吐
 python3 tests/integration.py --benchmark --rclone
 # 浏览器界面、密钥查看/复制与并发上传验证
