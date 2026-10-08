@@ -33,7 +33,8 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
     tmp = Path(tmp)
     app, state, fixtures = tmp / 'app', tmp / 'state', tmp / 'fixtures'
     app.mkdir(); fixtures.mkdir(); (app / 'tools').mkdir()
-    source = (ROOT / 'index.php').read_text()
+    source = re.sub(r"const QINDAV_VERSION = '[0-9]+\.[0-9]+\.[0-9]+';",
+                    "const QINDAV_VERSION = '1.1.0';", (ROOT / 'index.php').read_text())
     start, end = source.index('function updateDownload('), source.index('function updateRelease(')
     stub = '''function updateDownload(string $url, string $destination, int $limit): void
 {

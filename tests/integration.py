@@ -115,6 +115,7 @@ def suite(client, state):
     cfg = json.loads((state / 'config.json').read_text())
     check(cfg['username'] == USER and PASSWORD not in json.dumps(cfg), 'config contains hash, no plaintext')
     check(client.api('list')[0] == 200, 'session-authenticated file listing')
+    check(not (state / 'usage.json').exists(), 'first listing does not wait for initial usage scan')
     check(client.api('app-password', token=False)[0] == 403, 'API requires CSRF')
     check(client.dav('GET', auth=False)[0] == 401, 'anonymous DAV denied')
     check(client.call('GET', '/composer.json', auth=False)[0] == 404, 'dependency metadata not exposed')
@@ -462,6 +463,20 @@ def quota_check(client, state):
     info = client.api('storage')[1]
     check(info['used_bytes'] == used and info['files'] == files and info['available_bytes'] is None,
           'usage remains correct with unlimited capacity')
+    before = accounting.stat()
+    content = accounting.read_bytes()
+    client.api('storage'); client.api('list'); client.api('storage')
+    after = accounting.stat()
+    check(before.st_ino == after.st_ino and before.st_mtime_ns == after.st_mtime_ns
+          and accounting.read_bytes() == content, 'read-only usage and listing do not rewrite accounting')
+    usage = json.loads(content)
+    usage['reservations'] = dict(usage['reservations'])
+    usage['reservations']['expired-view'] = {'bytes': 999, 'expires': int(time.time()) - 1}
+    accounting.write_text(json.dumps(usage)); content = accounting.read_bytes()
+    check(client.api('storage')[1]['reserved_bytes'] == 0, 'read-only usage ignores expired reservations')
+    check(accounting.read_bytes() == content, 'view does not persist expired reservation cleanup')
+    client.api('storage-limit', {'limit_bytes': 0})
+
 
 
 def benchmark(client, state):

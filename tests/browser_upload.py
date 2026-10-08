@@ -1,4 +1,4 @@
-import os,signal,tempfile,subprocess,socket,time,urllib.request
+import os,re,signal,tempfile,subprocess,socket,time,urllib.request
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='qingdav-browser-') as tmp:
@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory(prefix='qingdav-browser-') as tmp:
    f.write(os.urandom(117))
  (data/'small.txt').write_text('browser small file verification')
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
- env={**os.environ,'WEBDAV_STATE_DIR':str(state),'PHP_CLI_SERVER_WORKERS':'4'}
+ env={**os.environ,'APP_VERSION':re.search(r"const QINDAV_VERSION = '([^']+)';",(ROOT/'index.php').read_text()).group(1),'WEBDAV_STATE_DIR':str(state),'PHP_CLI_SERVER_WORKERS':'4'}
  env.pop('WEBDAV_SETUP_TOKEN',None);env.pop('WEBDAV_ACCEL_PREFIX',None)
  with (tmp/'server.log').open('w+') as log:
   p=subprocess.Popen(['php','-d','memory_limit=128M','-S',f'127.0.0.1:{port}','tools/router.php'],cwd=ROOT,env=env,stdout=log,stderr=log,start_new_session=True)

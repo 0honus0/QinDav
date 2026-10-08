@@ -36,7 +36,7 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  assert.equal(await page.locator('#settings').evaluate(el=>el.matches(':modal')),true);
  page.on('dialog',dialog=>dialog.accept());
  await page.waitForFunction(()=>document.querySelector('#update-backups').textContent.includes('暂无程序备份'));
- assert.equal(await page.locator('#update-current').textContent(),'1.1.0');
+ assert.equal(await page.locator('#update-current').textContent(),process.env.APP_VERSION);
  await page.locator('#backup-keep').fill('3');await page.locator('#backup-save').click();
  await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('保留最近 3 份'));
  assert.equal((await (await page.request.post(process.env.BENCH_URL+'/?api=update-info',{headers:{'X-CSRF-Token':await page.evaluate(()=>csrf)},data:{}})).json()).keep,3);
@@ -89,12 +89,48 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.locator('#settings-button').click();await page.locator('#storage-rescan').click();await page.waitForFunction(()=>document.querySelector('#storage-result').textContent==='用量统计已更新');
  quota=await (await page.request.get(process.env.BENCH_URL+'/?api=storage')).json();assert.equal(quota.files,9);assert.equal(quota.reserved_bytes,0);
  await page.getByRole('button',{name:'关闭设置'}).click();
+
+ await page.setViewportSize({width:1280,height:800});
+ let listRect=await page.locator('#file-list').boundingBox();assert.ok(listRect.height/800>.78,'file list owns desktop viewport');
+ assert.ok(listRect.y<125,'compact desktop toolbar');
+ const large=root+'/Large directory';fs.mkdirSync(large);
+ for(let i=0;i<420;i++)fs.writeFileSync(large+'/'+String(i).padStart(4,'0')+'-document.txt','fixture');
+ await page.locator('#refresh').click();await page.waitForFunction(()=>document.querySelectorAll('#rows .filename').length===13);
+ await page.locator('#rows .filename').filter({hasText:'Large directory'}).click();await page.waitForFunction(()=>document.querySelectorAll('#rows .filename').length===200);
+ await page.locator('#rows .filename').first().evaluate(el=>el.dataset.marker='kept');
+ await page.locator('#refresh').click();await page.waitForFunction(()=>document.querySelector('#file-list').getAttribute('aria-busy')==='false');
+ assert.equal(await page.locator('#rows .filename').first().getAttribute('data-marker'),'kept','unchanged refresh preserves DOM');
+ const changedName=await page.locator('#rows .filename').first().textContent();fs.writeFileSync(large+'/'+changedName,'changed file contents');
+ await page.locator('#refresh').click();await page.waitForFunction(()=>!document.querySelector('#rows .filename[data-marker]'));
+ assert.equal(await page.locator('#rows .filename').first().textContent(),changedName);
+ assert.ok((await page.locator('#rows tr').filter({has:page.locator('.filename').filter({hasText:changedName})}).textContent()).includes('21 B'),'changed metadata re-renders');
+ await page.locator('#file-list').evaluate(el=>el.scrollTop=600);
+ const sticky=await page.locator('thead').boundingBox();listRect=await page.locator('#file-list').boundingBox();assert.ok(Math.abs(sticky.y-listRect.y)<2,'table header stays visible while scrolling');
+ await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#capacity').textContent.startsWith('第 2 页'));
+ assert.equal(await page.locator('#rows .filename').count(),200);assert.equal(await page.locator('#file-list').evaluate(el=>el.scrollTop),0);
+ await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#capacity').textContent.startsWith('第 3 页'));
+ assert.equal(await page.locator('#rows .filename').count(),20);assert.equal(await page.locator('#next').isDisabled(),true);
+ await page.getByRole('button',{name:'返回上级目录'}).click();await page.waitForFunction(()=>document.querySelectorAll('#rows .filename').length===13);
+ // A slow prior navigation must not replace the latest directory or its action paths.
+ await page.route('**/?api=list&path=Slow&offset=0',async route=>{await new Promise(resolve=>setTimeout(resolve,250));await route.fulfill({contentType:'application/json',body:JSON.stringify({items:[{name:'stale.txt',directory:false,size:1,modified:1700000000}],more:false,offset:0,free:100000})}).catch(()=>{});});
+ await page.evaluate(()=>{navigate('Slow');});await page.evaluate(()=>navigate('Photos'));await page.waitForFunction(()=>path==='Photos'&&!loading);
+ await page.waitForTimeout(300);assert.equal(await page.locator('#rows .filename').count(),0);assert.equal(await page.evaluate(()=>path),'Photos');
+ await page.evaluate(()=>navigate('Missing directory'));assert.equal(await page.evaluate(()=>path),'Photos','failed navigation preserves current path');
+ await page.evaluate(()=>status(''));await page.evaluate(()=>navigate(''));await page.waitForFunction(()=>document.querySelectorAll('#rows .filename').length===13);
+ // Capacity service can be slow: files must render without waiting for that response.
+ let releaseStorage,storageStartedResolve;const storageHold=new Promise(resolve=>releaseStorage=resolve),storageStarted=new Promise(resolve=>storageStartedResolve=resolve);
+ await page.route('**/?api=storage',async route=>{storageStartedResolve();await storageHold;await route.continue();});
+ await page.locator('#refresh').click();await storageStarted;await page.waitForFunction(()=>document.querySelector('#file-list').getAttribute('aria-busy')==='false');
+ assert.equal(await page.locator('#rows .filename').count(),13);releaseStorage();await page.unroute('**/?api=storage');
  await page.screenshot({path:'/tmp/qingdav-h5ai-desktop.png',fullPage:true});
  await page.setViewportSize({width:390,height:844});await page.screenshot({path:'/tmp/qingdav-h5ai-mobile.png',fullPage:true});
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'mobile layout does not overflow');
+ listRect=await page.locator('#file-list').boundingBox();assert.ok(listRect.height/844>.7,'file list owns mobile viewport');
+ await page.setViewportSize({width:320,height:640});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'narrow mobile does not overflow');
+ await page.setViewportSize({width:390,height:844});
  await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-mobile.png'});
  assert.equal(await page.locator('#settings').evaluate(el=>el.getBoundingClientRect().left>=0&&el.getBoundingClientRect().right<=innerWidth),true,'settings fit on mobile');
  await page.getByRole('button',{name:'关闭设置'}).click();await page.setViewportSize({width:1280,height:800});await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-desktop.png'});
- console.log(JSON.stringify({browser:'chromium',global_peak_concurrency:peak,chunk_requests:parts,small_direct_uploads:direct,chunk_retry_passed:failedPart,completion_retry_passed:lostFinish,all_hashes_verified:true,existing_file_preserved:true,filter_sort_navigation_settings_passed:true,quota_save_and_rescan_passed:true,update_and_backup_controls_passed:true,mobile_overflow:false,page_errors:errors}));
+ console.log(JSON.stringify({browser:'chromium',global_peak_concurrency:peak,chunk_requests:parts,small_direct_uploads:direct,chunk_retry_passed:failedPart,completion_retry_passed:lostFinish,all_hashes_verified:true,existing_file_preserved:true,filter_sort_navigation_settings_passed:true,quota_save_and_rescan_passed:true,update_and_backup_controls_passed:true,list_viewport_pagination_sticky_and_async_usage_passed:true,mobile_overflow:false,page_errors:errors}));
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

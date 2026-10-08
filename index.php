@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.1.0';
+const QINDAV_VERSION = '1.2.0';
 try { $applicationLock = applicationGate(); } catch (Throwable $error) {
     error_log('QinDav bootstrap: ' . $error->getMessage());
     http_response_code(503);
@@ -233,15 +233,33 @@ function storageReserved(array $usage, ?string $except = null): int
     return $bytes;
 }
 
+function storageSummary(array $usage): array
+{
+    $reserved = storageReserved($usage);
+    return ['used_bytes' => $usage['used_bytes'], 'files' => $usage['files'],
+        'limit_bytes' => $usage['limit_bytes'], 'reserved_bytes' => $reserved,
+        'available_bytes' => $usage['limit_bytes'] ? max(0, $usage['limit_bytes'] - $usage['used_bytes'] - $reserved) : null,
+        'disk_free_bytes' => disk_free_space(stateDir() . '/files')];
+}
+
 function storageInfo(bool $rescan = false): array
 {
+    if (!$rescan) {
+        $path = stateDir() . '/usage.json';
+        $lock = fopen($path . '.lock', 'c');
+        if ($lock === false || !flock($lock, LOCK_SH)) throw new RuntimeException('Cannot read storage accounting');
+        try {
+            $usage = readJson($path);
+            if ($usage && empty($usage['dirty'])) {
+                // Expired reservations no longer count; read-only views do not rewrite the ledger.
+                foreach ($usage['reservations'] as $id => $reservation) if ($reservation['expires'] <= time()) unset($usage['reservations'][$id]);
+                return storageSummary($usage);
+            }
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
     return storageTransaction(function (&$usage) use ($rescan) {
         if ($rescan) $usage = array_replace($usage, scanStorage());
-        $reserved = storageReserved($usage);
-        return ['used_bytes' => $usage['used_bytes'], 'files' => $usage['files'],
-            'limit_bytes' => $usage['limit_bytes'], 'reserved_bytes' => $reserved,
-            'available_bytes' => $usage['limit_bytes'] ? max(0, $usage['limit_bytes'] - $usage['used_bytes'] - $reserved) : null,
-            'disk_free_bytes' => disk_free_space(stateDir() . '/files')];
+        return storageSummary($usage);
     });
 }
 
@@ -445,6 +463,26 @@ final class FastDirectory extends DAV\FS\Directory implements DAV\IMoveTarget, D
             if ($type === 0040000) yield new self($path);
             elseif ($type === 0100000) yield new FastFile($path);
         }
+    }
+    public function listPage(int $offset, int $limit = 200): array
+    {
+        $directory = opendir($this->path);
+        if ($directory === false) throw new DAV\Exception\Forbidden('Cannot read directory');
+        $items = []; $position = 0; $more = false;
+        try {
+            while (($name = readdir($directory)) !== false) {
+                if (!validName($name)) continue;
+                $stat = @lstat($this->path . '/' . $name);
+                if ($stat === false) continue;
+                $type = $stat['mode'] & 0170000;
+                if (!in_array($type, [0040000, 0100000], true)) continue;
+                if ($position++ < $offset) continue;
+                if (count($items) === $limit) { $more = true; break; }
+                $items[] = ['name' => $name, 'directory' => $type === 0040000,
+                    'size' => $type === 0100000 ? $stat['size'] : null, 'modified' => $stat['mtime']];
+            }
+        } finally { closedir($directory); }
+        return ['items' => $items, 'more' => $more, 'offset' => $offset];
     }
     public function childExists($name)
     {
@@ -1284,18 +1322,7 @@ function handleApi(array $cfg, string $action): never
         }
         if (!$node instanceof FastDirectory) throw new DAV\Exception\NotFound('目录不存在');
         $offset = max(0, min(10000000, (int) ($_GET['offset'] ?? 0)));
-        $limit = 200;
-        $items = [];
-        $position = 0;
-        $more = false;
-        foreach ($node->getChildren() as $child) {
-            if ($position++ < $offset) continue;
-            if (count($items) === $limit) { $more = true; break; }
-            $items[] = ['name' => $child->getName(), 'directory' => $child instanceof FastDirectory,
-                'size' => $child instanceof FastFile ? $child->getSize() : null, 'modified' => $child->getLastModified()];
-        }
-        $storage = storageInfo();
-        jsonResponse(['items' => $items, 'more' => $more, 'offset' => $offset, 'free' => $storage['disk_free_bytes'], 'storage' => $storage]);
+        jsonResponse($node->listPage($offset) + ['free' => disk_free_space(stateDir() . '/files')]);
     }
     if ($action === 'upload-part') {
         if ($_SERVER['REQUEST_METHOD'] !== 'PUT') jsonResponse(['error' => '请求方法不支持'], 405);
@@ -1487,7 +1514,12 @@ try {
 <title>轻 DAV · 私人文件空间</title>
 <style nonce="<?= html($nonce) ?>">
 :root{color-scheme:light;--ink:#49535b;--muted:#9099a1;--line:#e8ecef;--accent:#3786bc;--hover:#f3f8fc}*{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font:14px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}button,input{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}main{max-width:1180px;margin:0 auto;padding:0 32px}header{height:76px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);gap:16px}.brand{font-size:21px;font-weight:400;letter-spacing:-.5px;display:flex;align-items:center;gap:10px}.brand span{color:var(--accent)}.brand-mark{width:26px;height:22px;border:1.5px solid var(--accent);border-radius:3px;position:relative}.brand-mark:before{content:"";position:absolute;left:2px;top:-6px;width:11px;height:5px;border:1.5px solid var(--accent);border-bottom:0;border-radius:3px 3px 0 0;background:white}.brand small{font-size:12px;letter-spacing:0;color:#a5adb3;margin-left:10px}h1{font-size:23px;font-weight:400;margin:0 0 8px}h2{font-size:17px;font-weight:500}p{color:var(--muted)}button,.button{border:1px solid #dde3e7;border-radius:4px;padding:7px 12px;background:white;color:var(--ink);text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}button:hover,.button:hover{background:#f5f7f9;border-color:#c9d3db}button:disabled{opacity:.4;cursor:default}.primary{background:var(--accent);border-color:var(--accent);color:white}.primary:hover{background:#2b75a6;border-color:#2b75a6}.quiet{border-color:transparent;color:var(--muted)}.icon{width:18px;height:18px;display:inline-block;flex-shrink:0;vertical-align:middle}.account{display:flex;align-items:center;gap:12px}.info{font-size:12px;color:var(--muted)}.auth{max-width:360px;margin:80px auto 120px}.auth p{margin:0 0 26px}.label{display:block;font-size:12px;margin:17px 0 6px;color:#78858f}input{width:100%;border:1px solid #dce3e8;border-radius:4px;padding:10px 12px;background:white;color:var(--ink)}.auth .primary{width:100%;margin-top:24px}.file-heading{display:flex;justify-content:space-between;align-items:center;padding:30px 0 20px;gap:16px}.file-heading h1{font-size:18px;margin:0;font-weight:500}.tools{display:flex;gap:8px;flex-wrap:wrap}.browser-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.crumb{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}.crumb button{border:0;padding:3px 6px;color:var(--accent);font-size:13px}.crumb button:last-of-type{color:var(--ink)}.crumb-separator{color:#b9c2c9;font-size:16px}.filter{position:relative;width:220px;flex-shrink:0}.filter input{padding:7px 10px 7px 32px;border-color:#edf0f2;background:#fafbfd;font-size:12px}.filter .icon{position:absolute;left:9px;top:9px;color:#9ba6ae;width:15px;height:15px}.status{font-size:12px;color:var(--accent);white-space:pre-wrap;overflow-wrap:anywhere}.status:not(:empty){padding:12px 0}progress{width:100%;height:4px;accent-color:var(--accent);display:block;margin:8px 0}progress[hidden]{display:none}.table-wrap{overflow:auto;min-height:300px}table{border-collapse:collapse;width:100%;white-space:nowrap}th{text-align:left;font-size:11px;font-weight:400;color:var(--muted);border-bottom:1px solid var(--line);height:42px;padding:0 12px}th:first-child,td:first-child{padding-left:10px}th button{border:0;padding:0;background:transparent!important;color:inherit;font-size:11px}th button[data-sort-direction]{color:var(--accent)}td{padding:10px 12px;border-bottom:1px solid #f0f3f5;height:50px;font-size:12px;color:#8a959d}tbody tr:hover{background:var(--hover)}td:first-child{min-width:220px;width:55%}.name{border:0;background:transparent!important;padding:0;font-size:13px;font-weight:400;text-align:left;justify-content:flex-start;max-width:560px;color:#53616c;gap:12px}.filename{display:block;overflow:hidden;text-overflow:ellipsis;max-width:440px}.name.dir{color:#466579}.file-icon{width:25px;height:28px;flex-shrink:0;color:#93a8b8}.file-icon.folder{color:#d2ae62}.file-icon.image{color:#75a891}.file-icon.archive{color:#b9a0c6}.file-icon.code{color:#7fa2c4}.actions{text-align:right;width:94px}.row-actions{display:flex;justify-content:flex-end;gap:3px;opacity:0}tr:hover .row-actions,tr:focus-within .row-actions{opacity:1}.row-actions button{border:0;background:transparent;padding:5px;color:#8998a4}.row-actions button:hover{color:var(--accent);background:#e8f1f8}.row-actions .delete:hover{color:#c56d6d;background:#faeeee}.empty{text-align:center;color:var(--muted);height:230px;font-size:13px}.pager{display:flex;justify-content:space-between;align-items:center;padding:15px 0;gap:10px}.pager button{font-size:12px;padding:5px 9px;border-color:transparent}.settings{width:min(680px,calc(100% - 32px));max-height:calc(100dvh - 48px);padding:0;margin:auto;border:1px solid #dfe6eb;border-radius:8px;color:var(--ink);background:white;box-shadow:0 16px 70px #24374926;overflow:auto;overscroll-behavior:contain}.settings::backdrop{background:#24374955}.dialog-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 24px;border-bottom:1px solid var(--line);position:sticky;top:0;background:white;z-index:1}.dialog-heading h2{margin:0;font-size:17px;font-weight:500}.settings-content{padding:22px 24px 26px}body.modal-open{overflow:hidden}.storage-panel{padding-bottom:22px;margin-bottom:22px;border-bottom:1px solid var(--line)}.storage-panel h3{font-size:14px;font-weight:500;margin:0 0 12px}.storage-summary{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px}.storage-used{font-size:20px;color:#536c7e;font-weight:400}.storage-meter{width:100%;height:10px;margin:12px 0 8px;accent-color:var(--accent)}.quota-row{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap}.quota-row label{flex:1;min-width:130px}.quota-row select{padding:10px 8px;border:1px solid #dce3e8;border-radius:4px;background:white;color:var(--ink);font:inherit}.storage-actions{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}.storage-actions button{font-size:12px}.connection{display:flex;align-items:center;justify-content:space-between;gap:16px;background:#f7f9fb;border:1px solid #eef1f4;padding:16px;margin-bottom:18px}.connection p{margin:5px 0}.connection code{font:12px ui-monospace,monospace;color:#5d7588;overflow-wrap:anywhere}.settings .tools{margin:15px 0}.password-grid{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;max-width:720px}.password-grid label{flex:1;min-width:180px}.error{color:#b76464;background:#fcf2f2;border-radius:4px;padding:10px;font-size:12px}footer{border-top:1px solid var(--line);font-size:11px;color:#a8b1b8;margin-top:38px;padding:20px 0 30px;display:flex;justify-content:space-between}.footer-note{color:#c0c7cc}@media(hover:none){.row-actions{opacity:1}}@media(max-width:700px){main{padding:0 16px}header{height:62px}.brand small,.account>.info,.modified{display:none}.brand{font-size:19px}.account{gap:4px}.account button{font-size:12px;padding:6px 8px}.file-heading{padding:22px 0 16px;align-items:flex-start}.tools{gap:5px}.tools button{padding:6px 8px;font-size:12px}.browser-bar{align-items:flex-start;flex-direction:column;gap:10px}.filter{width:100%}.filename{max-width:calc(100vw - 196px)}.name{gap:8px;font-size:12px}.file-icon{width:21px;height:24px}td:first-child{min-width:140px}.row-actions{opacity:1}.actions{width:64px}td{padding:9px 6px}.row-actions button{padding:4px}.connection{flex-direction:column;align-items:flex-start}.auth{margin:58px auto 90px}.pager .info{font-size:11px}footer{margin-top:26px}.file-heading h1{font-size:16px}}
+/* File browser uses the viewport; account settings stay in the modal. */
+body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;height:100%;padding:0 24px;display:flex;flex-direction:column}.app header{height:52px;flex-shrink:0}.app .brand{font-size:19px}.app .brand small{font-size:11px}.app .file-browser{display:flex;flex:1;flex-direction:column;min-height:0}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.app .browser-bar{padding:10px 0;gap:20px;border-top:0;flex-shrink:0}.app .crumb{flex:1;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;scrollbar-width:thin;min-height:30px;align-items:center}.app .crumb button{flex-shrink:0}.browser-tools{display:flex;align-items:center;gap:12px;min-width:0}.app .filter{width:180px}.app .browser-tools .tools{flex-wrap:nowrap}.app #status{flex-shrink:0;max-height:72px;overflow:auto}.app #status:not(:empty){padding:8px 0}.app progress{flex-shrink:0}.app .table-wrap{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.app table{table-layout:fixed}.app thead{position:sticky;top:0;z-index:1;background:#fff}.app th{height:36px;background:#fff;box-shadow:0 1px 0 var(--line)}.app th:nth-child(2){width:110px}.app th.modified{width:180px}.app th.actions{width:84px}.app td{height:40px;padding:6px 12px}.app td:first-child{width:auto;min-width:0}.app .name{max-width:100%;min-width:0;gap:10px}.app .filename{min-width:0;max-width:none}.app .file-icon{width:22px;height:24px}.app .row-actions button{min-width:30px;min-height:30px;padding:6px}.app .pager{flex-shrink:0;padding:7px 0;border-top:1px solid var(--line);min-height:42px;gap:12px}.app .pager>div{display:flex;flex-shrink:0}.app .pager .info{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.app footer{display:none}.loading-cell{text-align:center;color:var(--muted);height:120px!important}.app .table-wrap[aria-busy=true] tbody{opacity:.65}
+@media(min-width:1600px){.app main{padding:0 40px}}
+@media(max-width:700px){.app main{padding:0 12px}.app header{height:48px}.app .browser-bar{flex-direction:column;align-items:stretch;padding:6px 0 8px;gap:6px}.app .crumb{flex:none;width:100%;min-height:28px}.browser-tools{gap:6px;width:100%}.app .filter{width:auto;flex:1;min-width:80px}.app .filter input{font-size:12px;padding-right:6px}.app .browser-tools .tools{gap:4px;flex-shrink:0}.app .browser-tools button{padding:6px 7px;font-size:12px}.app th:nth-child(2){width:68px}.app th.actions{width:76px}.app td{padding:6px 5px;height:44px}.app .name{gap:7px;font-size:12px}.app .row-actions button{min-width:34px;min-height:34px;padding:7px}.app .pager{gap:5px;min-height:40px}.app .pager button{padding:6px;font-size:11px}.app .pager .info{font-size:11px}.app .file-icon{width:20px;height:23px}}
 </style>
+<body<?= $loggedIn ? ' class="app"' : '' ?>>
 <main>
 <header><div class="brand"><i class="brand-mark" aria-hidden="true"></i>轻<span>DAV</span><small>文件索引</small></div><div class="account"><?php if ($loggedIn): ?><span class="info"><?= html($cfg['username']) ?></span><form method="post"><input type="hidden" name="csrf" value="<?= html($csrfToken) ?>"><input type="hidden" name="action" value="logout"><button class="quiet" id="settings-button" type="button" aria-haspopup="dialog" aria-controls="settings" aria-expanded="false">设置</button><button class="quiet">退出</button></form><?php endif ?></div></header>
 <?php if (!$loggedIn): ?>
@@ -1496,10 +1528,9 @@ try {
 <form method="post"><input type="hidden" name="csrf" value="<?= html($csrfToken) ?>"><input type="hidden" name="action" value="<?= $cfg ? 'login' : 'setup' ?>"><label class="label" for="username">用户名</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label class="label" for="password">密码<?= $cfg ? '' : ' · 至少 12 字节' ?></label><input id="password" name="password" type="password" autocomplete="<?= $cfg ? 'current-password' : 'new-password' ?>" maxlength="72" required><?php if (!$cfg): ?><label class="label" for="confirm">确认密码</label><input id="confirm" name="confirm" type="password" autocomplete="new-password" required><?php if (getenv('WEBDAV_SETUP_TOKEN')): ?><label class="label" for="setup_token">初始化令牌</label><input id="setup_token" name="setup_token" type="password" required><?php endif ?><?php endif ?><button class="primary"><?= $cfg ? '登录' : '创建账号' ?></button></form></section>
 <?php else: ?>
 <section class="file-browser" aria-label="文件浏览">
-<div class="file-heading"><h1>文件</h1><div class="tools"><button class="primary" id="upload-button">上传文件</button><button id="mkdir">新建文件夹</button><button class="quiet" id="refresh" title="刷新文件列表">刷新</button><input type="file" id="files" multiple hidden></div></div>
-<div class="browser-bar"><nav class="crumb" id="breadcrumb" aria-label="当前路径"></nav><label class="filter"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="filter" type="search" placeholder="筛选当前页" aria-label="筛选当前页文件"></label></div>
+<h1 class="sr-only">文件</h1><div class="browser-bar"><nav class="crumb" id="breadcrumb" aria-label="当前路径"></nav><div class="browser-tools"><label class="filter"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="filter" type="search" placeholder="筛选当前页" aria-label="筛选当前页文件"></label><div class="tools"><button class="primary" id="upload-button">上传文件</button><button id="mkdir">新建文件夹</button><button class="quiet" id="refresh" title="刷新文件列表">刷新</button><input type="file" id="files" multiple hidden></div></div></div>
 <div class="status" id="status" role="status" aria-live="polite"></div><progress id="progress" value="0" max="1" hidden></progress>
-<div class="table-wrap"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="table-wrap" id="file-list" aria-busy="true"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="loading-cell">正在读取文件…</td></tr></tbody></table></div>
 <div class="pager"><span class="info" id="capacity"></span><div><button id="prev">上一页</button><button id="next">下一页</button></div></div>
 </section>
 <dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
@@ -1509,6 +1540,8 @@ const csrf = <?= json_encode($csrfToken) ?>, dav = <?= json_encode($davBase, JSO
 const $ = id => document.getElementById(id);
 let path = '', offset = 0, hasMore = false, loading = false, entries = [], freeSpace = 0, sortKey = 'name', sortDirection = 1, storage = null;
 const collator=new Intl.Collator('zh-CN',{numeric:true,sensitivity:'base'});
+const dateFormatter=new Intl.DateTimeFormat('zh-CN',{dateStyle:'short',timeStyle:'short'});
+let loadController=null,loadSerial=0,lastRendered='';const iconTemplates=new Map();
 const endpoint = new URL(dav, location.origin).href;
 $('endpoint').textContent = endpoint;
 function url(p) { return dav + p.split('/').filter(Boolean).map(encodeURIComponent).join('/'); }
@@ -1558,38 +1591,49 @@ async function uploadFile(file, destination, advance) {
 }
 function button(label, fn, className='') { const b=document.createElement('button');b.textContent=label;b.className=className;b.onclick=()=>Promise.resolve().then(fn).catch(e=>status(e.message));return b; }
 function icon(kind, className='icon') {
+ const key=kind+' '+className;if(iconTemplates.has(key))return iconTemplates.get(key).cloneNode(true);
  const paths={folder:'<path d="M3 7h7l2 2h9v11H3z" fill="currentColor" opacity=".2"/><path d="M3 7V5h7l2 2h9v13H3z"/>',file:'<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h4M9 12h6M9 15h6"/>',image:'<rect x="4" y="3" width="16" height="18" rx="1"/><circle cx="9" cy="8" r="1.5"/><path d="m5 18 5-6 4 4 3-3 3 5"/>',archive:'<path d="M6 3h12v18H6zM11 3v12M11 7h3M11 11h3"/><path d="M10 16h4v3h-4z"/>',code:'<path d="M6 3h8l4 4v14H6zM14 3v5h4M10 12l-2 3 2 3M14 12l2 3-2 3"/>',rename:'<path d="m4 16 11-11 4 4L8 20H4zM13 7l4 4"/>',delete:'<path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7"/>',up:'<path d="M12 20V4m-6 6 6-6 6 6"/>'};
  const span=document.createElement('span');span.className=className;span.setAttribute('aria-hidden','true');
- span.innerHTML=`<svg viewBox="0 0 24 24" width="100%" height="100%" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">${paths[kind]||paths.file}</svg>`;return span;
+ span.innerHTML=`<svg viewBox="0 0 24 24" width="100%" height="100%" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">${paths[kind]||paths.file}</svg>`;iconTemplates.set(key,span);return span.cloneNode(true);
 }
 function fileIcon(item){if(item.directory)return icon('folder','file-icon folder');const ext=item.name.split('.').pop().toLowerCase();const type=/^(png|jpg|jpeg|gif|webp|svg|avif|bmp)$/.test(ext)?'image':/^(zip|gz|tar|7z|rar|bz2|xz)$/.test(ext)?'archive':/^(php|js|ts|py|html|css|json|xml|sh|c|cpp|rs)$/.test(ext)?'code':'file';return icon(type,`file-icon ${type}`);}
 function actionButton(label,fn,kind,className=''){const b=button(label,fn,className);b.replaceChildren(icon(kind));b.setAttribute('aria-label',label);b.title=label;return b;}
-function navigate(p) { if(loading)return;path=p;offset=0;$('filter').value='';load(); }
+function navigate(p) { return load({nextPath:p,nextOffset:0,resetFilter:true,reloadStorage:!storage}); }
 function renderItems(){
  const query=$('filter').value.trim().toLocaleLowerCase();const items=entries.filter(item=>item.name.toLocaleLowerCase().includes(query));
  items.sort((a,b)=>{if(a.directory!==b.directory)return a.directory?-1:1;const value=sortKey==='name'?collator.compare(a.name,b.name):(a[sortKey]||0)-(b[sortKey]||0);return (value||collator.compare(a.name,b.name))*sortDirection;});
- $('rows').replaceChildren();
- if(path&&!query){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;const name=button('..',()=>navigate(path.split('/').slice(0,-1).join('/')),'name dir');name.prepend(icon('up','file-icon'));name.setAttribute('aria-label','返回上级目录');cell.append(name);row.append(cell);$('rows').append(row);}
+ const signature=JSON.stringify([path,offset,query,sortKey,sortDirection,items.map(item=>[item.name,item.directory,item.size,item.modified])]);
+ if(signature===lastRendered){renderCapacity(items.length,query);return;}
+ const fragment=document.createDocumentFragment();
+ if(path&&!query){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;const name=button('..',()=>navigate(path.split('/').slice(0,-1).join('/')),'name dir');name.prepend(icon('up','file-icon'));name.setAttribute('aria-label','返回上级目录');cell.append(name);row.append(cell);fragment.append(row);}
  for(const item of items){
   const p=(path?path+'/':'')+item.name,row=document.createElement('tr'),name=document.createElement('td'),bytes=document.createElement('td'),date=document.createElement('td'),actions=document.createElement('td');
   const filename=button('',()=>item.directory?navigate(p):location.assign(url(p)),`name ${item.directory?'dir':''}`),label=document.createElement('span');label.className='filename';label.textContent=item.name;filename.title=item.name;filename.append(fileIcon(item),label);name.append(filename);
-  bytes.textContent=item.directory?'—':size(item.size);date.textContent=new Date(item.modified*1000).toLocaleString();date.className='modified';actions.className='actions';const tools=document.createElement('div');tools.className='row-actions';
+  bytes.textContent=item.directory?'—':size(item.size);date.textContent=dateFormatter.format(new Date(item.modified*1000));date.className='modified';actions.className='actions';const tools=document.createElement('div');tools.className='row-actions';
   tools.append(actionButton('移动 / 重命名',async()=>{const destination=prompt('目标路径（从根目录开始，不加开头的 /）',p);if(destination===null||destination===p)return;if(!destination||destination.split('/').some(n=>!n||n==='.'||n==='..'))throw Error('请输入有效目标路径');await request(p,{method:'MOVE',headers:{Destination:new URL(url(destination),location.origin).href,Overwrite:'F'}});status('移动完成');await load();},'rename'),actionButton('删除',async()=>{if(!confirm(`删除“${item.name}”${item.directory?'及其全部内容':''}？`))return;await request(p,{method:'DELETE'});status('已删除');await load();},'delete','delete'));
-  actions.append(tools);row.append(name,bytes,date,actions);$('rows').append(row);
+  actions.append(tools);row.append(name,bytes,date,actions);fragment.append(row);
  }
- if(!items.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;cell.className='empty';cell.textContent=query?'没有匹配的文件':offset?'本页没有文件，请返回上一页':'此目录为空，点击右上角上传文件。';row.append(cell);$('rows').append(row);}
- $('capacity').textContent=`已用 ${size(storage?.used_bytes||0)}${storage?.limit_bytes?` / ${size(storage.limit_bytes)}`:''} · ${query?`匹配 ${items.length} / ${entries.length} 项`:`本页 ${entries.length} 项`} · 可用 ${size(freeSpace)}`;
+ if(!items.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;cell.className='empty';cell.textContent=query?'没有匹配的文件':offset?'本页没有文件，请返回上一页':'此目录为空，点击右上角上传文件。';row.append(cell);fragment.append(row);}
+ $('rows').replaceChildren(fragment);lastRendered=signature;renderCapacity(items.length,query);
  for(const [key,label] of Object.entries({name:'名称',size:'大小',modified:'修改时间'})){const b=$('sort-'+key);b.textContent=label+(sortKey===key?(sortDirection===1?' ↑':' ↓'):'');b.parentElement.setAttribute('aria-sort',sortKey===key?(sortDirection===1?'ascending':'descending'):'none');if(sortKey===key)b.setAttribute('data-sort-direction',String(sortDirection));else b.removeAttribute('data-sort-direction');}
 }
-async function load() {
- if(loading)return; loading=true; $('prev').disabled=$('next').disabled=true;
+function renderCapacity(count=entries.length,query=$('filter').value.trim()){
+ const usage=storage?`已用 ${size(storage.used_bytes)}${storage.limit_bytes?` / ${size(storage.limit_bytes)}`:''} · `:'';
+ $('capacity').textContent=`${query?`匹配 ${count} / ${entries.length} 项`:`第 ${Math.floor(offset/200)+1} 页 · ${entries.length} 项`}${storage?` · ${usage}可用 ${size(storage.available_bytes??freeSpace)}`:''}`;
+}
+async function load({nextPath=path,nextOffset=offset,resetFilter=false,reloadStorage=true}={}) {
+ const serial=++loadSerial;loadController?.abort();loadController=new AbortController();loading=true;$('file-list').setAttribute('aria-busy','true');$('prev').disabled=$('next').disabled=true;
  try {
- const response=await fetch(`/?api=list&path=${encodeURIComponent(path)}&offset=${offset}`,{credentials:'same-origin',cache:'no-store'});
- const data=await response.json();if(!response.ok)throw Error(data.error||'读取失败');
- $('breadcrumb').replaceChildren(button('全部文件',()=>navigate('')));
- let partial='';for(const part of path.split('/').filter(Boolean)){partial+=(partial?'/':'')+part;const destination=partial,separator=document.createElement('span');separator.className='crumb-separator';separator.textContent='/';$('breadcrumb').append(separator,button(part,()=>navigate(destination)));}
- entries=data.items;freeSpace=data.free;storage=data.storage;hasMore=data.more;renderItems();
- }catch(e){status(e.message);}finally{loading=false;$('prev').disabled=offset===0;$('next').disabled=!hasMore;}
+  const response=await fetch(`/?api=list&path=${encodeURIComponent(nextPath)}&offset=${nextOffset}`,{credentials:'same-origin',cache:'no-store',signal:loadController.signal});
+  const data=await response.json();if(!response.ok)throw Error(data.error||'读取失败');if(serial!==loadSerial)return;
+  const moved=path!==nextPath||offset!==nextOffset;path=nextPath;offset=nextOffset;if(resetFilter)$('filter').value='';
+  $('breadcrumb').replaceChildren(button('全部文件',()=>navigate('')));
+  let partial='';for(const part of path.split('/').filter(Boolean)){partial+=(partial?'/':'')+part;const destination=partial,separator=document.createElement('span');separator.className='crumb-separator';separator.textContent='/';$('breadcrumb').append(separator,button(part,()=>navigate(destination)));}
+  entries=data.items;freeSpace=data.free;hasMore=data.more;renderItems();if(moved)$('file-list').scrollTop=0;
+  // Show files first; capacity recovery or a first-time scan runs separately.
+  if(reloadStorage||!storage)loadStorage().catch(()=>{});
+ }catch(e){if(e.name!=='AbortError'&&serial===loadSerial){status(e.message);const cell=$('rows').querySelector('.loading-cell');if(cell)cell.textContent='读取失败，点击刷新重试';}}
+ finally{if(serial===loadSerial){loading=false;$('file-list').setAttribute('aria-busy','false');$('prev').disabled=offset===0;$('next').disabled=!hasMore;}}
 }
 $('filter').oninput=renderItems;
 for(const key of ['name','size','modified'])$('sort-'+key).onclick=()=>{if(sortKey===key)sortDirection*=-1;else{sortKey=key;sortDirection=1;}renderItems();};
@@ -1601,7 +1645,7 @@ function renderStorage(info,fillLimit=true){
  $('storage-remaining').textContent=`${info.available_bytes===null?'磁盘可用':'额度剩余'} ${size(info.available_bytes??info.disk_free_bytes)}${info.available_bytes!==null?` · 磁盘可用 ${size(info.disk_free_bytes)}`:''}${info.reserved_bytes?` · 上传预留 ${size(info.reserved_bytes)}`:''}`;
  if(fillLimit&&!quotaEdited){const unit=info.limit_bytes&&info.limit_bytes<1073741824?1048576:1073741824;$('quota-unit').value=String(unit);$('quota-limit').value=info.limit_bytes/unit;}
 }
-async function loadStorage(){const request=++storageRequest;const response=await fetch('/?api=storage',{credentials:'same-origin',cache:'no-store'});const info=await response.json();if(!response.ok)throw Error(info.error||'读取用量失败');if(request===storageRequest)renderStorage(info);}
+async function loadStorage(){const request=++storageRequest;const response=await fetch('/?api=storage',{credentials:'same-origin',cache:'no-store'});const info=await response.json();if(!response.ok)throw Error(info.error||'读取用量失败');if(request===storageRequest){freeSpace=info.disk_free_bytes;renderStorage(info);renderCapacity(entries.filter(item=>item.name.toLocaleLowerCase().includes($('filter').value.trim().toLocaleLowerCase())).length);}}
 $('settings-button').onclick=()=>{quotaEdited=false;settings.showModal();document.body.classList.add('modal-open');$('settings-button').setAttribute('aria-expanded','true');if(storage)renderStorage(storage);loadStorage().catch(error=>$('storage-result').textContent=error.message);loadUpdates().catch(error=>$('update-result').textContent=error.message);};
 $('quota-form').onsubmit=async event=>{event.preventDefault();const bytes=Math.round(Number($('quota-limit').value)*Number($('quota-unit').value));if(!Number.isSafeInteger(bytes)||bytes<0){$('storage-result').textContent='请输入有效容量';return;}$('quota-save').disabled=true;++storageRequest;try{const info=await api('storage-limit',{limit_bytes:bytes});quotaEdited=false;renderStorage(info);$('storage-result').textContent='容量上限已保存';await load();}catch(error){$('storage-result').textContent=error.message;}finally{$('quota-save').disabled=false;}};
 $('storage-rescan').onclick=async()=>{$('storage-rescan').disabled=true;++storageRequest;$('storage-result').textContent='正在统计…';try{renderStorage(await api('storage-rescan'));$('storage-result').textContent='用量统计已更新';await load();}catch(error){$('storage-result').textContent=error.message;}finally{$('storage-rescan').disabled=false;}};
@@ -1611,7 +1655,7 @@ settings.addEventListener('cancel',hideAppPassword);
 settings.addEventListener('close',()=>{hideAppPassword();$('app-result').textContent='';document.body.classList.remove('modal-open');$('settings-button').setAttribute('aria-expanded','false');});
 settings.addEventListener('click',event=>{const rect=settings.getBoundingClientRect();if(event.target===settings&&(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom))closeSettings();});
 $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText(endpoint);status('连接地址已复制');}catch{status(endpoint);}};
-$('refresh').onclick=()=>load();$('prev').onclick=()=>{if(!loading){offset=Math.max(0,offset-200);load();}};$('next').onclick=()=>{if(!loading&&hasMore){offset+=200;load();}};
+$('refresh').onclick=()=>load();$('prev').onclick=()=>{if(!loading)load({nextOffset:Math.max(0,offset-200),reloadStorage:false});};$('next').onclick=()=>{if(!loading&&hasMore)load({nextOffset:offset+200,reloadStorage:false});};
 $('mkdir').onclick=async()=>{const name=prompt('文件夹名称');if(!name)return;if(name.includes('/')||name.includes('\\')||name==='.'||name==='..'){status('请输入有效的文件夹名称');return;}try{await request((path?path+'/':'')+name,{method:'MKCOL'});status('文件夹已创建');await load();}catch(e){status(e.message);}};
 $('upload-button').onclick=()=>$('files').click();
 $('files').onchange=async()=>{
@@ -1646,4 +1690,5 @@ load();
 <?php endif ?>
 <footer><span>轻 DAV · 私人文件空间</span><span class="footer-note">simple files, simply yours.</span></footer>
 </main>
+</body>
 </html>
