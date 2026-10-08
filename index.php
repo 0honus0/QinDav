@@ -1508,6 +1508,30 @@ function handleApi(array $cfg, string $action): never
     session_write_close();
     if (!$authenticated) jsonResponse(['error' => '请先登录'], 401);
     if ($action === 'storage' && $_SERVER['REQUEST_METHOD'] === 'GET') jsonResponse(storageInfo());
+    if ($action === 'performance-log' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+        // Snapshot under a short read lock, then release it before sending to a slow browser.
+        $lock = fopen(stateDir() . '/performance.log.lock', 'c');
+        if ($lock === false || !flock($lock, LOCK_SH)) throw new RuntimeException('Cannot read diagnostic log');
+        $snapshot = '';
+        try {
+            foreach (['performance.previous.ndjson', 'performance.ndjson'] as $name) {
+                $path = stateDir() . '/' . $name;
+                if (!is_file($path) || is_link($path)) continue;
+                $stream = fopen($path, 'rb');
+                if ($stream === false) throw new RuntimeException('Cannot open diagnostic log');
+                try { $part = stream_get_contents($stream, PERFORMANCE_LOG_MAX_BYTES); }
+                finally { fclose($stream); }
+                if ($part === false) throw new RuntimeException('Cannot read diagnostic log');
+                $snapshot .= $part;
+            }
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Cache-Control: no-store');
+        header('X-Content-Type-Options: nosniff');
+        echo $snapshot === '' ? "暂无 WebDAV 请求日志。上传完成后重新打开此地址。\n" : $snapshot;
+        exit;
+    }
+
     if ($action === 'list' && $_SERVER['REQUEST_METHOD'] === 'GET') {
         $path = trim((string) ($_GET['path'] ?? ''), '/');
         $node = new FastDirectory(stateDir() . '/files', 'root');
