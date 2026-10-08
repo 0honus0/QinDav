@@ -7,7 +7,7 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.7';
+const QINDAV_VERSION = '1.4.8';
 const PERFORMANCE_LOG_ENABLED = true;
 const PERFORMANCE_LOG_MAX_BYTES = 2 * 1024 * 1024;
 // Keep only baseline timestamps until the existing configuration read decides whether to log.
@@ -2008,6 +2008,17 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
   .app .table-wrap{width:calc(100% + 24px);margin-inline:-12px;scrollbar-gutter:auto}
   .app th:first-child,.app td:first-child{padding-left:12px}
   .app th.actions,.app td.actions{padding-right:12px}
+  /* Use explicit three-column rows on phones. A hidden date column and
+     colspan placeholder rows must not affect the width of the action column. */
+  .app #file-list table,.app #file-list thead,.app #file-list tbody{display:block;width:100%}
+  .app #file-list tr{display:grid;grid-template-columns:minmax(0,1fr) 78px 86px;width:100%;align-items:center}
+  .app #file-list th,.app #file-list td{display:block;min-width:0;width:auto}
+  .app #file-list .modified{display:none}
+  .app #file-list td[colspan]{grid-column:1 / -1}
+  .app #file-list th:nth-child(2),.app #file-list td:nth-child(2){text-align:right;overflow:hidden;text-overflow:ellipsis}
+  .app #file-list th.actions,.app #file-list td.actions{width:auto;padding-right:8px;text-align:right}
+  .app #file-list .row-actions{gap:2px}
+
 }
 </style>
 <body<?= $loggedIn ? ' class="app"' : '' ?>>

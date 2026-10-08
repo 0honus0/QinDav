@@ -131,16 +131,42 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  // A search field must never share the same cramped row as the mobile action buttons.
  const mobileMetrics=async width=>{
   const box=await page.evaluate(()=>{
-   const rect=selector=>{const {left,right,top,bottom,width}=document.querySelector(selector).getBoundingClientRect();return {left,right,top,bottom,width};};
-   return {search:rect('#filter'),tools:rect('.browser-tools .tools'),list:rect('#file-list'),viewport:innerWidth};
+   const rect=selector=>{
+    const el=document.querySelector(selector);if(!el)return null;
+    const {left,right,top,bottom,width}=el.getBoundingClientRect();return {left,right,top,bottom,width};
+   };
+   return {
+    viewport:innerWidth,search:rect('#filter'),tools:rect('.browser-tools .tools'),
+    list:rect('#file-list'),table:rect('#file-list table'),
+    name:rect('#file-list thead th:first-child'),size:rect('#file-list thead th:nth-child(2)'),
+    actions:rect('#file-list thead th.actions'),
+    row:rect('#rows tr'),rowActions:rect('#rows tr td.actions'),
+    lastButton:rect('#rows tr td.actions button:last-child'),
+    spanningCell:rect('#rows tr td[colspan]')
+   };
   });
   assert.equal(box.viewport,width);
   assert.ok(box.search.width>=width-32,'mobile search input remains readable: '+JSON.stringify(box));
   assert.ok(box.tools.top>=box.search.bottom-1,'mobile actions do not squeeze the search input');
-  assert.ok(Math.abs(box.list.left)<=1&&Math.abs(box.list.right-width)<=1,'mobile list reaches both screen edges: '+JSON.stringify(box));
+  for(const key of ['list','table','row','actions']){
+   assert.ok(Math.abs(box[key].left-(key==='actions'?box.size.right:0))<=2 || key==='actions'&&box.actions.left>=box.size.right-2,'mobile '+key+' alignment: '+JSON.stringify(box));
+   assert.ok(Math.abs(box[key].right-width)<=2,'mobile '+key+' reaches right screen edge: '+JSON.stringify(box));
+  }
+  assert.ok(Math.abs(box.name.right-box.size.left)<=2,'name and size columns are adjacent: '+JSON.stringify(box));
+  assert.ok(Math.abs(box.size.right-box.actions.left)<=2,'size and action columns are adjacent: '+JSON.stringify(box));
+  if(box.rowActions){
+   assert.ok(Math.abs(box.rowActions.right-width)<=2,'file action cells reach screen edge: '+JSON.stringify(box));
+   assert.ok(width-box.lastButton.right<=12,'file action buttons stay near screen edge: '+JSON.stringify(box));
+  }
+  if(box.spanningCell)assert.ok(box.spanningCell.width>=width-2,'folder parent/empty row spans all columns: '+JSON.stringify(box));
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile document does not overflow');
  };
  await mobileMetrics(390);
+ await page.locator('#rows .filename').filter({hasText:'Large directory'}).click();
+ await page.waitForFunction(()=>path==='Large directory'&&!loading);
+ await mobileMetrics(390);
+ await page.getByRole('button',{name:'返回上级目录'}).click();
+ await page.waitForFunction(()=>path===''&&!loading);
  await page.locator('#rows .filename').filter({hasText:'Documents'}).click();
  await page.waitForFunction(()=>path==='Documents'&&!loading);
  await mobileMetrics(390);
