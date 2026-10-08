@@ -35,6 +35,27 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.locator('#settings-button').click();assert.equal(await page.locator('#settings').evaluate(el=>el.open),true);
  assert.equal(await page.locator('#settings').evaluate(el=>el.matches(':modal')),true);
  page.on('dialog',dialog=>dialog.accept());
+ await page.waitForFunction(()=>document.querySelector('#update-backups').textContent.includes('暂无程序备份'));
+ assert.equal(await page.locator('#update-current').textContent(),'1.1.0');
+ await page.locator('#backup-keep').fill('3');await page.locator('#backup-save').click();
+ await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('保留最近 3 份'));
+ assert.equal((await (await page.request.post(process.env.BENCH_URL+'/?api=update-info',{headers:{'X-CSRF-Token':await page.evaluate(()=>csrf)},data:{}})).json()).keep,3);
+ let available=true,installedVersion=null,restoredId=null;
+ await page.route('**/?api=update-check',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({current:'1.1.0',latest:available?'1.2.0':'1.1.0',available,can_update:true,requirements:[]})}));
+ await page.route('**/?api=update-install',route=>{installedVersion=route.request().postDataJSON().version;return route.fulfill({status:423,contentType:'application/json',body:JSON.stringify({error:'仍有文件传输正在执行，请稍后重试'})});});
+ await page.locator('#update-check').click();await page.waitForFunction(()=>!document.querySelector('#update-install').disabled);
+ await page.locator('#update-install').click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('仍有文件传输'));
+ assert.equal(installedVersion,'1.2.0');
+ available=false;await page.locator('#update-check').click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent==='当前已是最新版本');
+ assert.equal(await page.locator('#update-install').isDisabled(),true);
+ const backupId='job-'+'0'.repeat(24);
+ await page.route('**/?api=update-info',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({current:'1.1.0',can_update:true,requirements:[],keep:3,backups:[{id:backupId,version:'1.0.0',created_at:1700000000}]})}));
+ await page.route('**/?api=update-restore',route=>{restoredId=route.request().postDataJSON().id;return route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'备份内容校验失败，不能回退'})});});
+ await page.getByRole('button',{name:'关闭设置'}).click();await page.locator('#settings-button').click();
+ await page.getByRole('button',{name:'回退此版本'}).click();await page.waitForFunction(()=>document.querySelector('#update-result').textContent.includes('备份内容校验失败'));
+ assert.equal(restoredId,backupId);
+ await page.unroute('**/?api=update-info');
+
  await page.locator('#app-password').click();await page.waitForFunction(()=>document.querySelector('#app-secret').value.length===48);
  const appPassword=await page.locator('#app-secret').inputValue();
  await page.locator('#copy-app').click();await page.waitForFunction(()=>document.querySelector('#app-result').textContent==='应用密码已复制');
@@ -74,6 +95,6 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require(
  await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-mobile.png'});
  assert.equal(await page.locator('#settings').evaluate(el=>el.getBoundingClientRect().left>=0&&el.getBoundingClientRect().right<=innerWidth),true,'settings fit on mobile');
  await page.getByRole('button',{name:'关闭设置'}).click();await page.setViewportSize({width:1280,height:800});await page.locator('#settings-button').click();await page.screenshot({path:'/tmp/qingdav-settings-desktop.png'});
- console.log(JSON.stringify({browser:'chromium',global_peak_concurrency:peak,chunk_requests:parts,small_direct_uploads:direct,chunk_retry_passed:failedPart,completion_retry_passed:lostFinish,all_hashes_verified:true,existing_file_preserved:true,filter_sort_navigation_settings_passed:true,quota_save_and_rescan_passed:true,mobile_overflow:false,page_errors:errors}));
+ console.log(JSON.stringify({browser:'chromium',global_peak_concurrency:peak,chunk_requests:parts,small_direct_uploads:direct,chunk_retry_passed:failedPart,completion_retry_passed:lostFinish,all_hashes_verified:true,existing_file_preserved:true,filter_sort_navigation_settings_passed:true,quota_save_and_rescan_passed:true,update_and_backup_controls_passed:true,mobile_overflow:false,page_errors:errors}));
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

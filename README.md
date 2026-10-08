@@ -15,6 +15,7 @@
 - 标准 WebDAV：PROPFIND、PUT、GET、HEAD、MKCOL、COPY、MOVE、DELETE、LOCK、UNLOCK。
 - HTTP 条件请求、ETag、下载字节范围；rclone 使用 `vendor = other`。
 - 文件锁使用 JSON 和 `flock`，整个读改写事务加锁，原子替换状态文件。
+- 在设置中检查 GitHub 最新版本并更新；自动备份、可配置保留份数、按内容去重及一键回退。
 
 ## 快速运行
 
@@ -43,6 +44,9 @@ usage.json        容量上限、增量用量统计、上传额度预留
 usage.json.lock   用量和额度事务锁
 locks.json        WebDAV 锁，仅发生 LOCK 操作后创建
 locks.json.lock   WebDAV 锁事务锁
+application.lock 请求与程序替换协调锁
+updates/         程序更新临时文件及版本备份
+update-*.json    版本检查缓存、备份保留策略及中断恢复日志
 ```
 
 ## 打包复制
@@ -185,6 +189,8 @@ MOVE 不增加用量。WebDAV 提供 quota-used-bytes 和 quota-available-bytes 
 composer install --no-dev --optimize-autoloader
 # 安装 rclone 后进行协议、权限、容量、分块和实际客户端验证
 python3 tests/integration.py --rclone
+# 更新、回退、去重、校验与中断恢复；使用临时实例及本地下载夹具
+python3 tests/update.py
 # 可选本地回环基准；不代表公网吞吐
 python3 tests/integration.py --benchmark --rclone
 # 浏览器界面、密钥查看/复制与并发上传验证
@@ -201,7 +207,7 @@ python3 tools/build.py
 ## GitHub Actions
 
 - **Test**：main 推送及 Pull Request 自动运行 PHP 8.2、8.3、8.4 的协议与 rclone 测试；
-  PHP 8.4 还运行 Chromium 浏览器测试；所有版本检查部署包。
+  所有 PHP 版本运行更新/回退测试，PHP 8.4 还运行 Chromium 浏览器测试；所有版本检查部署包。
 - **Release**：推送 `vX.Y.Z` 标签触发发布。也可在 Actions 中手动运行 Release，
   填写尚未使用的版本标签。发布先通过完整测试，再从 Composer 锁文件安装生产依赖，
   生成并上传 `QinDav.zip` 与 `SHA256SUMS` 到 GitHub Releases。
@@ -212,5 +218,30 @@ git push origin v1.0.0
 ```
 
 用户部署时下载 Release 中的 `QinDav.zip`，无需安装 Composer、Node 或测试工具。
-压缩包仅包含 `index.php`、`dav.php` 和 `vendor/`。目前升级通过覆盖文件完成，
-应用内自动更新尚未实现。
+压缩包仅包含 `index.php`、`dav.php` 和 `vendor/`。
+
+## 应用内更新与回退
+
+首次从旧版升级至 v1.1.0，需要手动覆盖部署包。之后在右上角设置的“程序更新”中
+检查最新稳定版本并点击“立即更新”。发布源固定为 `0honus0/QinDav` 的 GitHub Releases；
+PHP 通过验证证书的 HTTPS 下载部署包及 `SHA256SUMS`，检查 SHA-256、包内路径和版本。
+校验值来自同一受信任的 GitHub 发布源，并非独立的数字签名。
+
+自动更新需要 PHP cURL 和 ZIP 扩展、应用目录写权限、状态与应用目录位于同一文件系统，
+并能访问 GitHub API 与发布下载地址。设置会显示未满足的条件，仍可下载 ZIP 手动覆盖。
+更新下载期间正常请求可继续；替换前若仍有传输或其他请求执行，更新返回“稍后重试”。
+替换阶段暂停接收新请求，已进入 PHP 的上传或下载不会被替换动作打断。
+前置服务接管的下载不受 PHP 锁协调，但其用户文件不会被程序更新改动。
+
+更新与回退只替换 `index.php`、`dav.php` 和 `vendor/`。账号、应用密码、容量设置和用户文件
+留在状态目录，回退不会恢复或删除用户数据。目录替换失败自动恢复旧程序；PHP 进程在
+替换中断后，下次请求会先处理恢复日志，再加载依赖，恢复完成时请重试请求。
+
+每次替换前备份当前程序，默认保留最近 **2** 份，可在设置中改为 **1–10** 份。
+降低保留份数立即清理超额备份。备份按入口和依赖的路径与文件内容生成 SHA-256 指纹：
+两个版本来回切换时复用相同快照，并更新其保留顺序，不重复保存。同版本号但内容不同
+的程序仍视为不同快照。选中的备份与当前程序完全相同时，不执行回退；回退前再次
+校验备份内容。设置中列出版本与首次备份时间，最近使用的快照优先保留，可直接点击“回退此版本”。
+
+手动覆盖 ZIP 本身不生成应用备份。保留目录位于私有状态目录的 `updates/`，不在网站根目录。
+若主机禁止程序写入、无法正常执行更新恢复，仍可手动复制备份中的 `old/` 内容恢复程序。

@@ -2,6 +2,8 @@
 """Package the management app, dedicated DAV entry and runtime dependencies."""
 import hashlib
 import json
+import argparse
+import re
 from pathlib import Path
 import subprocess
 import zipfile
@@ -10,15 +12,23 @@ ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / 'dist'
 
 
-def build():
+def build(version=None):
     if not (ROOT / 'vendor/autoload.php').is_file():
         raise SystemExit('Run composer install --no-dev --optimize-autoloader first.')
     subprocess.run(['php', '-l', str(ROOT / 'index.php')], check=True)
     subprocess.run(['php', '-l', str(ROOT / 'dav.php')], check=True)
     DIST.mkdir(exist_ok=True)
     archive = DIST / 'QinDav.zip'
+    source = (ROOT / 'index.php').read_text()
+    if version is not None:
+        if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+            raise SystemExit('Version must be X.Y.Z')
+        source, count = re.subn(r"const QINDAV_VERSION = '[0-9]+\.[0-9]+\.[0-9]+';",
+                               f"const QINDAV_VERSION = '{version}';", source)
+        if count != 1:
+            raise SystemExit('Application version constant missing or duplicated')
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
-        bundle.write(ROOT / 'index.php', 'index.php')
+        bundle.writestr('index.php', source)
         bundle.write(ROOT / 'dav.php', 'dav.php')
         for path in sorted((ROOT / 'vendor').rglob('*')):
             if path.is_file() and not path.is_symlink():
@@ -37,4 +47,6 @@ def build():
 
 
 if __name__ == '__main__':
-    build()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', help='Stamp the deployment package version (X.Y.Z)')
+    build(parser.parse_args().version)

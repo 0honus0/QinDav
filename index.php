@@ -7,6 +7,12 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
+const QINDAV_VERSION = '1.1.0';
+try { $applicationLock = applicationGate(); } catch (Throwable $error) {
+    error_log('QinDav bootstrap: ' . $error->getMessage());
+    http_response_code(503);
+    exit('程序更新恢复未完成，请检查服务器日志和目录权限。');
+}
 if (!is_file(__DIR__ . '/vendor/autoload.php')) {
     http_response_code(503);
     exit('请先运行 composer install --no-dev --optimize-autoloader');
@@ -857,6 +863,409 @@ function updateUpload(string $action, string $id, string $epoch): array
     }
 }
 
+function updateRemove(string $path): void
+{
+    if (is_link($path) || is_file($path)) { if (!unlink($path)) throw new RuntimeException('Cannot remove update file'); return; }
+    if (!is_dir($path)) return;
+    foreach (new FilesystemIterator($path, FilesystemIterator::SKIP_DOTS) as $entry) updateRemove($entry->getPathname());
+    if (!rmdir($path)) throw new RuntimeException('Cannot remove update directory');
+}
+
+function updateInvalidate(): void
+{
+    if (!function_exists('opcache_invalidate')) return;
+    foreach (['index.php', 'dav.php'] as $name) @opcache_invalidate(__DIR__ . '/' . $name, true);
+    if (is_dir(__DIR__ . '/vendor')) {
+        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator(__DIR__ . '/vendor', FilesystemIterator::SKIP_DOTS));
+        foreach ($iterator as $entry) if ($entry->isFile() && !$entry->isLink() && $entry->getExtension() === 'php') @opcache_invalidate($entry->getPathname(), true);
+    }
+}
+
+// Called before loading vendor, so an interrupted directory swap can be recovered.
+function updateRecover(): bool
+{
+    $journalPath = stateDir() . '/update-journal.json';
+    $journal = readJson($journalPath);
+    if (!$journal) return false;
+    if (!preg_match('/^job-[a-f0-9]{24}$/D', $journal['job'] ?? '')) throw new RuntimeException('Invalid update journal');
+    $job = stateDir() . '/updates/' . $journal['job'];
+    if (($journal['committed'] ?? false) === true) {
+        updateRecordBackup($journal);
+    } else {
+        foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+            $backup = $job . '/old/' . $name;
+            $live = __DIR__ . '/' . $name;
+            if (file_exists($backup)) {
+                if (is_dir($backup)) updateRemove($live);
+                if (!rename($backup, $live)) throw new RuntimeException('Cannot restore previous application');
+            } elseif (($journal['existed'][$name] ?? true) === false && !file_exists($job . '/new/' . $name)) {
+                updateRemove($live);
+            }
+        }
+        updateInvalidate();
+    }
+    if (!unlink($journalPath)) throw new RuntimeException('Cannot clear update journal');
+    if (!in_array($journal['job'], array_column(updateBackups()['backups'], 'id'), true)) updateRemove($job);
+    return true;
+}
+
+function applicationGate(): mixed
+{
+    $lock = fopen(stateDir() . '/application.lock', 'c');
+    if ($lock === false) throw new RuntimeException('Cannot open application lock');
+    if (!flock($lock, LOCK_SH | LOCK_NB)) {
+        header('Retry-After: 5');
+        jsonResponse(['error' => '正在更新程序，请稍后重试'], 503);
+    }
+    if (is_file(stateDir() . '/update-journal.json')) {
+        flock($lock, LOCK_UN);
+        if (!flock($lock, LOCK_EX | LOCK_NB)) {
+            header('Retry-After: 5');
+            jsonResponse(['error' => '正在恢复程序，请稍后重试'], 503);
+        }
+        updateRecover();
+        header('Retry-After: 1');
+        jsonResponse(['error' => '程序恢复完成，请重试请求'], 503);
+    }
+    return $lock; // PHP closes this handle and releases the shared lock at request end.
+}
+
+function updateCapabilities(): array
+{
+    $errors = [];
+    if (!extension_loaded('curl')) $errors[] = '主机 PHP 未启用 cURL 扩展';
+    if (!class_exists('ZipArchive')) $errors[] = '主机 PHP 未启用 ZIP 扩展';
+    $restricted = (string) ini_get('opcache.restrict_api');
+    if (filter_var(ini_get('opcache.enable'), FILTER_VALIDATE_BOOLEAN)
+        && (!function_exists('opcache_invalidate') || ($restricted !== '' && !str_starts_with(__FILE__, $restricted)))) {
+        $errors[] = '主机禁止清除 PHP 程序缓存，无法安全自动替换';
+    }
+    if (!is_writable(__DIR__)) $errors[] = 'PHP 没有应用目录写入权限';
+    foreach (['index.php', 'dav.php', 'vendor'] as $name) {
+        $path = __DIR__ . '/' . $name;
+        if (is_link($path)) $errors[] = '应用入口与依赖不能使用符号链接';
+        if (file_exists($path) && !is_writable($path)) $errors[] = $name . ' 不可写';
+    }
+    if (stat(__DIR__)['dev'] !== stat(stateDir())['dev']) $errors[] = '应用目录与状态目录必须在同一文件系统';
+    return ['current' => QINDAV_VERSION, 'can_update' => !$errors, 'requirements' => $errors];
+}
+
+function updateAllowedUrl(string $url): bool
+{
+    $parts = parse_url($url);
+    return is_array($parts) && ($parts['scheme'] ?? '') === 'https'
+        && !isset($parts['user']) && !isset($parts['pass']) && !isset($parts['port'])
+        && in_array($parts['host'] ?? '', ['api.github.com', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'], true);
+}
+
+function updateDownload(string $url, string $destination, int $limit): void
+{
+    if (!extension_loaded('curl')) throw new InvalidArgumentException('检查更新需要 PHP cURL 扩展');
+    for ($redirect = 0; $redirect < 6; ++$redirect) {
+        if (!updateAllowedUrl($url)) throw new InvalidArgumentException('更新下载地址无效');
+        $output = fopen($destination, 'wb');
+        if ($output === false) throw new RuntimeException('Cannot create update download');
+        $curl = curl_init($url);
+        $bytes = 0; $location = null;
+        curl_setopt_array($curl, [CURLOPT_USERAGENT => 'QinDav/' . QINDAV_VERSION,
+            CURLOPT_HTTPHEADER => ['Accept: application/vnd.github+json'], CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 180, CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_HEADERFUNCTION => function ($handle, string $line) use (&$location): int {
+                if (str_starts_with(strtolower($line), 'location:')) $location = trim(substr($line, 9));
+                return strlen($line);
+            },
+            CURLOPT_WRITEFUNCTION => function ($handle, string $chunk) use ($output, $limit, &$bytes): int {
+                $bytes += strlen($chunk);
+                return $bytes <= $limit ? (int) fwrite($output, $chunk) : 0;
+            }]);
+        try {
+            $success = curl_exec($curl);
+            $code = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+            if ($success === false) throw new InvalidArgumentException('下载更新失败，请检查网络或下载大小限制');
+            if (in_array($code, [301, 302, 303, 307, 308], true) && is_string($location)) { $url = $location; continue; }
+            if ($code !== 200) throw new InvalidArgumentException('GitHub 更新服务返回 HTTP ' . $code . '，请稍后重试');
+            return;
+        } finally {
+            fclose($output);
+            curl_close($curl);
+        }
+    }
+    throw new InvalidArgumentException('更新下载重定向过多');
+}
+
+function updateRelease(bool $fresh = false): array
+{
+    $cache = stateDir() . '/update-cache.json';
+    $data = readJson($cache);
+    if (!$fresh && ($data['checked_at'] ?? 0) > time() - 300) return $data;
+    $tmp = tempnam(stateDir(), '.update-check-');
+    if ($tmp === false) throw new RuntimeException('Cannot create update check');
+    try {
+        updateDownload('https://api.github.com/repos/0honus0/QinDav/releases/latest', $tmp, 1048576);
+        $release = readJson($tmp);
+        $tag = $release['tag_name'] ?? '';
+        if (!is_string($tag) || !preg_match('/^v(\d+\.\d+\.\d+)$/D', $tag, $match)
+            || !empty($release['draft']) || !empty($release['prerelease'])) throw new InvalidArgumentException('发布版本信息无效');
+        $assets = [];
+        foreach ($release['assets'] ?? [] as $asset) {
+            $name = $asset['name'] ?? '';
+            if (in_array($name, ['QinDav.zip', 'SHA256SUMS'], true)) {
+                $expected = 'https://github.com/0honus0/QinDav/releases/download/' . $tag . '/' . $name;
+                if (($asset['browser_download_url'] ?? '') !== $expected) throw new InvalidArgumentException('发布文件地址无效');
+                $assets[$name] = $expected;
+            }
+        }
+        if (count($assets) !== 2) throw new InvalidArgumentException('发布版本缺少部署包或校验文件');
+        $data = ['version' => $match[1], 'tag' => $tag, 'assets' => $assets, 'checked_at' => time()];
+        atomicJson($cache, $data);
+        return $data;
+    } finally { if (is_file($tmp)) unlink($tmp); }
+}
+
+function updateStatus(bool $fresh = false): array
+{
+    $release = updateRelease($fresh);
+    return updateCapabilities() + ['latest' => $release['version'],
+        'available' => version_compare($release['version'], QINDAV_VERSION, '>'),
+        'release_url' => 'https://github.com/0honus0/QinDav/releases/tag/' . $release['tag']];
+}
+
+function updateExtract(string $archive, string $destination, string $version): void
+{
+    $zip = new ZipArchive();
+    if ($zip->open($archive, ZipArchive::CHECKCONS) !== true) throw new InvalidArgumentException('更新 ZIP 文件损坏');
+    try {
+        if ($zip->numFiles > 5000) throw new InvalidArgumentException('更新包文件数量超限');
+        $total = 0; $seen = [];
+        for ($i = 0; $i < $zip->numFiles; ++$i) {
+            $stat = $zip->statIndex($i);
+            $name = $stat['name'];
+            $parts = explode('/', rtrim($name, '/'));
+            if (isset($seen[$name]) || preg_match('/[\x00-\x1f\x7f\\\\]/', $name) || in_array('', $parts, true)
+                || in_array('..', $parts, true) || in_array('.', $parts, true)
+                || !(in_array($name, ['index.php', 'dav.php'], true) || str_starts_with($name, 'vendor/'))) {
+                throw new InvalidArgumentException('更新包包含非法路径');
+            }
+            $seen[$name] = true;
+            $zip->getExternalAttributesIndex($i, $system, $attributes);
+            $type = ($attributes >> 16) & 0170000;
+            if (!in_array($type, [0, 0100000, 0040000], true) || ($type === 0040000 && !str_ends_with($name, '/'))) {
+                throw new InvalidArgumentException('更新包包含符号链接或特殊文件');
+            }
+            $total += $stat['size'];
+            if ($total > 64 * 1024 * 1024) throw new InvalidArgumentException('更新包解压大小超限');
+        }
+        foreach (['index.php', 'dav.php', 'vendor/autoload.php', 'vendor/composer/autoload_real.php'] as $required) {
+            if (!isset($seen[$required])) throw new InvalidArgumentException('更新包缺少必要程序文件');
+        }
+        $source = $zip->getFromName('index.php');
+        if (!is_string($source) || !preg_match("/const QINDAV_VERSION = '([0-9]+\\.[0-9]+\\.[0-9]+)';/", $source, $match)
+            || $match[1] !== $version) throw new InvalidArgumentException('更新包版本与发布版本不一致');
+        if (disk_free_space(stateDir()) < $total + 8 * 1024 * 1024) throw new InvalidArgumentException('磁盘空间不足以解压更新');
+        // Every path has been checked; streams keep extraction memory bounded.
+        for ($i = 0; $i < $zip->numFiles; ++$i) {
+            $stat = $zip->statIndex($i); $name = $stat['name']; $path = $destination . '/' . $name;
+            if (str_ends_with($name, '/')) { if (!is_dir($path) && !mkdir($path, 0755, true)) throw new RuntimeException('Cannot extract directory'); continue; }
+            if (!is_dir(dirname($path)) && !mkdir(dirname($path), 0755, true)) throw new RuntimeException('Cannot extract parent');
+            $input = $zip->getStream($name); $output = fopen($path, 'xb');
+            if ($input === false || $output === false) throw new RuntimeException('Cannot extract file');
+            try {
+                if (stream_copy_to_stream($input, $output, $stat['size'] + 1) !== $stat['size']) throw new InvalidArgumentException('更新包文件长度无效');
+            } finally { fclose($input); fclose($output); }
+            chmod($path, 0644);
+        }
+    } finally { $zip->close(); }
+}
+
+function updateBackups(): array
+{
+    $data = readJson(stateDir() . '/update-backups.json');
+    return ['keep' => max(1, min(10, (int) ($data['keep'] ?? 2))), 'backups' => $data['backups'] ?? []];
+}
+
+function updateSaveBackups(array $data): void
+{
+    $discarded = array_slice($data['backups'], $data['keep']);
+    $data['backups'] = array_slice($data['backups'], 0, $data['keep']);
+    atomicJson(stateDir() . '/update-backups.json', $data);
+    foreach ($discarded as $backup) {
+        if (preg_match('/^job-[a-f0-9]{24}$/D', $backup['id'] ?? '')) {
+            try { updateRemove(stateDir() . '/updates/' . $backup['id']); }
+            catch (Throwable $ignored) { error_log('QinDav: old update backup cleanup failed'); }
+        }
+    }
+}
+
+function updateSnapshotHash(string $root): string
+{
+    $files = [];
+    foreach (['index.php', 'dav.php', 'vendor'] as $name) {
+        $path = $root . '/' . $name;
+        if (is_link($path)) throw new InvalidArgumentException('程序快照包含符号链接');
+        if (is_file($path)) { $files[$name] = $path; continue; }
+        if (!is_dir($path)) throw new InvalidArgumentException('程序快照缺少必要文件');
+        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS));
+        foreach ($iterator as $entry) {
+            if (!$entry->isFile() || $entry->isLink()) throw new InvalidArgumentException('程序快照包含特殊文件');
+            $files[substr($entry->getPathname(), strlen($root) + 1)] = $entry->getPathname();
+        }
+    }
+    ksort($files, SORT_STRING); $hash = hash_init('sha256');
+    foreach ($files as $relative => $path) {
+        $digest = hash_file('sha256', $path);
+        if ($digest === false) throw new RuntimeException('Cannot hash application snapshot');
+        hash_update($hash, $relative . "\0" . $digest . "\n");
+    }
+    return hash_final($hash);
+}
+
+function updateRecordBackup(array $journal): void
+{
+    $data = updateBackups(); $existing = null;
+    foreach ($data['backups'] as $backup) {
+        if (($backup['fingerprint'] ?? '') === $journal['fingerprint']) { $existing = $backup; break; }
+    }
+    if ($existing) {
+        // Reuse the exact snapshot and refresh its retention order when switching versions.
+        $data['backups'] = array_values(array_filter($data['backups'], fn($backup) => $backup['id'] !== $existing['id']));
+        array_unshift($data['backups'], $existing);
+    } else {
+        array_unshift($data['backups'], ['id' => $journal['job'], 'version' => $journal['previous_version'],
+            'created_at' => $journal['created_at'], 'fingerprint' => $journal['fingerprint']]);
+    }
+    updateSaveBackups($data);
+}
+
+class UpdateBusy extends DAV\Exception
+{
+    public function getHTTPCode(): int { return 423; }
+}
+
+function updateTaskLock(): mixed
+{
+    $lock = fopen(stateDir() . '/update.lock', 'c');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) throw new UpdateBusy('另一个更新或回退任务正在运行');
+    // A killed download has no journal and is safe to discard while owning the task lock.
+    $retained = array_column(updateBackups()['backups'], 'id');
+    $pending = readJson(stateDir() . '/update-journal.json')['job'] ?? null;
+    foreach (glob(stateDir() . '/updates/job-*') ?: [] as $path) {
+        $id = basename($path);
+        if (preg_match('/^job-[a-f0-9]{24}$/D', $id) && !in_array($id, $retained, true) && $id !== $pending) updateRemove($path);
+    }
+    return $lock;
+}
+
+function updatePublish(string $jobName, string $sessionEpoch, string $version): array
+{
+    $job = stateDir() . '/updates/' . $jobName;
+    $gate = $GLOBALS['applicationLock'];
+    flock($gate, LOCK_UN);
+    if (!flock($gate, LOCK_EX | LOCK_NB)) throw new UpdateBusy('仍有文件传输或其他请求正在执行，请稍后重试');
+    $current = config();
+    if (!hash_equals($current['session_epoch'], $sessionEpoch)) throw new DAV\Exception\Forbidden('Session expired');
+    $journal = ['job' => $jobName, 'committed' => false, 'existed' => [], 'previous_version' => QINDAV_VERSION,
+        'created_at' => time(), 'fingerprint' => updateSnapshotHash(__DIR__)];
+    foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+        $journal['existed'][$name] = file_exists(__DIR__ . '/' . $name);
+        if (is_link(__DIR__ . '/' . $name)) throw new InvalidArgumentException('应用文件变成了符号链接，请重新检查');
+    }
+    atomicJson(stateDir() . '/update-journal.json', $journal);
+    try {
+        foreach (['vendor', 'dav.php', 'index.php'] as $name) {
+            $live = __DIR__ . '/' . $name;
+            if ($journal['existed'][$name]) {
+                $backup = $job . '/old/' . $name;
+                if (is_dir($live)) {
+                    if (!rename($live, $backup)) throw new RuntimeException('Cannot back up ' . $name);
+                } else {
+                    // Keep PHP entry files present until the new file atomically replaces them.
+                    if (!copy($live, $backup . '.tmp') || !rename($backup . '.tmp', $backup)) throw new RuntimeException('Cannot back up ' . $name);
+                }
+            }
+            if (!rename($job . '/new/' . $name, $live)) throw new RuntimeException('Cannot publish ' . $name);
+        }
+        updateInvalidate();
+        $journal['committed'] = true;
+        atomicJson(stateDir() . '/update-journal.json', $journal);
+    } catch (Throwable $error) {
+        try { updateRecover(); } catch (Throwable $recoveryError) { throw $recoveryError; }
+        throw new InvalidArgumentException('程序替换失败，已恢复旧版本，请检查主机目录权限');
+    }
+    // Once committed, later housekeeping failures must never report the swap as failed.
+    try {
+        updateRecordBackup($journal);
+        unlink(stateDir() . '/update-journal.json');
+        foreach (['QinDav.zip', 'SHA256SUMS', 'new'] as $name) updateRemove($job . '/' . $name);
+    } catch (Throwable $error) { error_log('QinDav: committed update housekeeping: ' . $error->getMessage()); }
+    return ['ok' => true, 'version' => $version];
+}
+
+function installUpdate(string $expectedVersion, string $sessionEpoch): array
+{
+    $capabilities = updateCapabilities();
+    if (!$capabilities['can_update']) throw new InvalidArgumentException(implode('；', $capabilities['requirements']));
+    $lock = updateTaskLock();
+    $jobName = 'job-' . bin2hex(random_bytes(12));
+    $job = stateDir() . '/updates/' . $jobName;
+    try {
+        $release = updateRelease(true);
+        if ($release['version'] !== $expectedVersion) throw new DAV\Exception\Conflict('最新版本已变化，请重新检查更新');
+        if (!version_compare($release['version'], QINDAV_VERSION, '>')) throw new DAV\Exception\Conflict('当前版本已是最新版本');
+        if (!mkdir($job . '/new', 0700, true) || !mkdir($job . '/old', 0700)) throw new RuntimeException('Cannot prepare update');
+        updateDownload($release['assets']['SHA256SUMS'], $job . '/SHA256SUMS', 8192);
+        $checksum = file_get_contents($job . '/SHA256SUMS');
+        if (!preg_match('/^([a-f0-9]{64})  QinDav\.zip\s*$/D', $checksum, $match)) throw new InvalidArgumentException('更新校验文件格式无效');
+        updateDownload($release['assets']['QinDav.zip'], $job . '/QinDav.zip', 32 * 1024 * 1024);
+        if (!hash_equals($match[1], hash_file('sha256', $job . '/QinDav.zip'))) throw new InvalidArgumentException('更新包 SHA-256 校验失败');
+        updateExtract($job . '/QinDav.zip', $job . '/new', $release['version']);
+        return updatePublish($jobName, $sessionEpoch, $release['version']);
+    } finally {
+        // A job referenced by the recovery journal must survive an interrupted rollback.
+        $backups = updateBackups()['backups'];
+        $retained = in_array($jobName, array_column($backups, 'id'), true)
+            || (readJson(stateDir() . '/update-journal.json')['job'] ?? '') === $jobName;
+        if (!$retained && is_dir($job)) updateRemove($job);
+        flock($lock, LOCK_UN); fclose($lock);
+    }
+}
+
+function updateCopy(string $source, string $destination): void
+{
+    if (is_link($source)) throw new InvalidArgumentException('备份包含符号链接');
+    if (is_dir($source)) {
+        if (!mkdir($destination, 0755)) throw new RuntimeException('Cannot stage backup directory');
+        foreach (new FilesystemIterator($source, FilesystemIterator::SKIP_DOTS) as $entry) updateCopy($entry->getPathname(), $destination . '/' . $entry->getFilename());
+    } elseif (is_file($source)) {
+        if (!copy($source, $destination)) throw new RuntimeException('Cannot stage backup file');
+        chmod($destination, 0644);
+    } else { throw new InvalidArgumentException('备份文件缺失或无效'); }
+}
+
+function restoreUpdate(string $backupId, string $sessionEpoch): array
+{
+    $capabilities = updateCapabilities();
+    if (!$capabilities['can_update']) throw new InvalidArgumentException(implode('；', $capabilities['requirements']));
+    $lock = updateTaskLock();
+    $jobName = 'job-' . bin2hex(random_bytes(12));
+    $job = stateDir() . '/updates/' . $jobName;
+    try {
+        $backup = null;
+        foreach (updateBackups()['backups'] as $entry) if ($entry['id'] === $backupId) $backup = $entry;
+        if (!$backup || !preg_match('/^job-[a-f0-9]{24}$/D', $backupId)) throw new DAV\Exception\NotFound('备份不存在');
+        if (($backup['fingerprint'] ?? '') === updateSnapshotHash(__DIR__)) throw new DAV\Exception\Conflict('当前程序与此备份完全相同，无需回退');
+        if (($backup['fingerprint'] ?? '') !== updateSnapshotHash(stateDir() . '/updates/' . $backupId . '/old')) throw new InvalidArgumentException('备份内容校验失败，不能回退');
+        if (!mkdir($job . '/new', 0700, true) || !mkdir($job . '/old', 0700)) throw new RuntimeException('Cannot prepare restore');
+        foreach (['vendor', 'dav.php', 'index.php'] as $name) updateCopy(stateDir() . '/updates/' . $backupId . '/old/' . $name, $job . '/new/' . $name);
+        return updatePublish($jobName, $sessionEpoch, $backup['version']);
+    } finally {
+        $retained = in_array($jobName, array_column(updateBackups()['backups'], 'id'), true)
+            || (readJson(stateDir() . '/update-journal.json')['job'] ?? '') === $jobName;
+        if (!$retained && is_dir($job)) updateRemove($job);
+        flock($lock, LOCK_UN); fclose($lock);
+    }
+}
+
 function handleApi(array $cfg, string $action): never
 {
     openSession();
@@ -900,6 +1309,28 @@ function handleApi(array $cfg, string $action): never
     if ($raw === false || strlen($raw) > 8192) jsonResponse(['error' => '请求过大'], 413);
     $body = json_decode($raw, true, 8, JSON_THROW_ON_ERROR);
     if (!is_array($body)) jsonResponse(['error' => '请求格式错误'], 400);
+    if ($action === 'update-info') jsonResponse(updateCapabilities() + updateBackups());
+    if ($action === 'update-backup-limit') {
+        $keep = $body['keep'] ?? null;
+        if (!is_int($keep) || $keep < 1 || $keep > 10) throw new InvalidArgumentException('备份保留份数应为 1–10');
+        $lock = updateTaskLock();
+        try { $data = updateBackups(); $data['keep'] = $keep; updateSaveBackups($data); }
+        finally { flock($lock, LOCK_UN); fclose($lock); }
+        jsonResponse(updateBackups());
+    }
+    if ($action === 'update-restore') {
+        set_time_limit(600);
+        $id = $body['id'] ?? '';
+        if (!is_string($id)) throw new InvalidArgumentException('备份标识无效');
+        jsonResponse(restoreUpdate($id, $sessionEpoch));
+    }
+    if ($action === 'update-check') { set_time_limit(240); jsonResponse(updateStatus(true)); }
+    if ($action === 'update-install') {
+        set_time_limit(600);
+        $version = $body['version'] ?? '';
+        if (!is_string($version) || !preg_match('/^\d+\.\d+\.\d+$/D', $version)) throw new InvalidArgumentException('更新版本无效');
+        jsonResponse(installUpdate($version, $sessionEpoch));
+    }
     if ($action === 'storage-rescan') {
         set_time_limit(0);
         jsonResponse(storageInfo(true));
@@ -1043,7 +1474,7 @@ try {
     if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
     $status = $e instanceof DAV\Exception ? $e->getHTTPCode() : ($e instanceof InvalidArgumentException || $e instanceof JsonException ? 400 : 500);
     if (isset($_GET['api'])) jsonResponse(['error' => match ($status) {
-        500 => '服务器错误，请检查日志', 423 => '目标路径已被 WebDAV 客户端锁定', default => $e->getMessage(),
+        500 => '服务器错误，请检查日志', 423 => $e instanceof UpdateBusy ? $e->getMessage() : '目标路径已被 WebDAV 客户端锁定', default => $e->getMessage(),
     }], $status);
     http_response_code($status);
     exit('应用暂时不可用，请检查服务器日志和存储目录权限。');
@@ -1071,7 +1502,7 @@ try {
 <div class="table-wrap"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"></tbody></table></div>
 <div class="pager"><span class="info" id="capacity"></span><div><button id="prev">上一页</button><button id="next">下一页</button></div></div>
 </section>
-<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
+<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
 <script nonce="<?= html($nonce) ?>">
 'use strict';
 const csrf = <?= json_encode($csrfToken) ?>, dav = <?= json_encode($davBase, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
@@ -1171,7 +1602,7 @@ function renderStorage(info,fillLimit=true){
  if(fillLimit&&!quotaEdited){const unit=info.limit_bytes&&info.limit_bytes<1073741824?1048576:1073741824;$('quota-unit').value=String(unit);$('quota-limit').value=info.limit_bytes/unit;}
 }
 async function loadStorage(){const request=++storageRequest;const response=await fetch('/?api=storage',{credentials:'same-origin',cache:'no-store'});const info=await response.json();if(!response.ok)throw Error(info.error||'读取用量失败');if(request===storageRequest)renderStorage(info);}
-$('settings-button').onclick=()=>{quotaEdited=false;settings.showModal();document.body.classList.add('modal-open');$('settings-button').setAttribute('aria-expanded','true');if(storage)renderStorage(storage);loadStorage().catch(error=>$('storage-result').textContent=error.message);};
+$('settings-button').onclick=()=>{quotaEdited=false;settings.showModal();document.body.classList.add('modal-open');$('settings-button').setAttribute('aria-expanded','true');if(storage)renderStorage(storage);loadStorage().catch(error=>$('storage-result').textContent=error.message);loadUpdates().catch(error=>$('update-result').textContent=error.message);};
 $('quota-form').onsubmit=async event=>{event.preventDefault();const bytes=Math.round(Number($('quota-limit').value)*Number($('quota-unit').value));if(!Number.isSafeInteger(bytes)||bytes<0){$('storage-result').textContent='请输入有效容量';return;}$('quota-save').disabled=true;++storageRequest;try{const info=await api('storage-limit',{limit_bytes:bytes});quotaEdited=false;renderStorage(info);$('storage-result').textContent='容量上限已保存';await load();}catch(error){$('storage-result').textContent=error.message;}finally{$('quota-save').disabled=false;}};
 $('storage-rescan').onclick=async()=>{$('storage-rescan').disabled=true;++storageRequest;$('storage-result').textContent='正在统计…';try{renderStorage(await api('storage-rescan'));$('storage-result').textContent='用量统计已更新';await load();}catch(error){$('storage-result').textContent=error.message;}finally{$('storage-rescan').disabled=false;}};
 function closeSettings(){hideAppPassword();settings.close();}
@@ -1200,6 +1631,15 @@ $('view-app').onclick=async()=>{if(!$('app-secret').hidden){hideAppPassword();re
 $('copy-app').onclick=async()=>{const serial=++appRequest;try{const password=await readAppPassword();if(serial!==appRequest||!settings.open)return;try{await navigator.clipboard.writeText(password);if(serial===appRequest&&settings.open)$('app-result').textContent='应用密码已复制';}catch{if(serial===appRequest&&settings.open){showAppPassword(password);$('app-secret').select();$('app-result').textContent='请手动复制应用密码';}}}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
 $('app-password').onclick=async()=>{if(!confirm('生成新应用密码后，旧应用密码会立即失效。继续？'))return;hideAppPassword();const serial=appRequest;try{const result=await api('app-password');if(serial===appRequest&&settings.open){showAppPassword(result.password);$('app-result').textContent='应用密码已生成，可随时回来查看';}}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
 $('revoke-app').onclick=async()=>{if(!confirm('撤销应用密码后，使用该密码的客户端将无法连接。继续？'))return;hideAppPassword();const serial=appRequest;try{await api('revoke-app-password');if(serial===appRequest&&settings.open)$('app-result').textContent='应用密码已撤销';}catch(e){if(serial===appRequest&&settings.open)$('app-result').textContent=e.message;}};
+function renderBackups(info){$('backup-keep').value=info.keep;const list=$('update-backups');list.replaceChildren();for(const backup of info.backups){const row=document.createElement('div');row.className='storage-actions';const label=document.createElement('span');label.className='info';label.textContent=`${backup.version} · ${new Date(backup.created_at*1000).toLocaleString()}`;const restore=document.createElement('button');restore.type='button';restore.textContent='回退此版本';restore.disabled=updateBusy||!canRestore;restore.onclick=()=>restoreBackup(backup);row.append(label,restore);list.append(row);}if(!info.backups.length){const empty=document.createElement('p');empty.className='info';empty.textContent='暂无程序备份，更新或回退前会自动备份当前版本。';list.append(empty);}}
+let canRestore=false;
+async function loadUpdates(){const info=await api('update-info');canRestore=info.can_update;$('update-current').textContent=info.current;renderBackups(info);if(!info.can_update)$('update-result').textContent=info.requirements.join('；')+'，请使用发布包手动更新';}
+function setUpdateBusy(busy){updateBusy=busy;$('update-check').disabled=busy;$('update-install').disabled=busy||!updateVersion||!canRestore;$('backup-save').disabled=busy;for(const button of $('update-backups').querySelectorAll('button'))button.disabled=busy||!canRestore;}
+async function restoreBackup(backup){if(updateBusy||!confirm(`回退到 ${backup.version}？当前程序会先备份，账号和用户文件保留。请先暂停其他客户端的传输。`))return;setUpdateBusy(true);$('update-result').textContent='正在备份当前程序并回退…';try{await api('update-restore',{id:backup.id});location.reload();}catch(e){$('update-result').textContent=e.message+'；如连接中断，请刷新页面检查当前版本';setUpdateBusy(false);}}
+$('backup-form').onsubmit=async event=>{event.preventDefault();if(updateBusy)return;const keep=Number($('backup-keep').value);if(!Number.isInteger(keep)||keep<1||keep>10){$('update-result').textContent='请输入 1–10 的整数';return;}setUpdateBusy(true);try{const info=await api('update-backup-limit',{keep});renderBackups(info);$('update-result').textContent=`已设置保留最近 ${keep} 份备份，超出部分已清理`;}catch(e){$('update-result').textContent=e.message;}finally{setUpdateBusy(false);}};
+let updateVersion=null,updateBusy=false;
+$('update-check').onclick=async()=>{if(updateBusy)return;updateVersion=null;setUpdateBusy(true);$('update-result').textContent='正在检查 GitHub 最新版本…';try{const info=await api('update-check');canRestore=info.can_update;updateVersion=info.available?info.latest:null;$('update-result').textContent=(info.available?`发现新版本 ${info.latest}`:'当前已是最新版本')+(info.can_update?'':`\n${info.requirements.join('；')}，请下载发布包手动更新`);$('update-install').disabled=!info.available||!info.can_update;}catch(e){$('update-result').textContent=e.message;}finally{setUpdateBusy(false);}};
+$('update-install').onclick=async()=>{if(updateBusy||!updateVersion)return;if(!confirm(`更新到 ${updateVersion}？程序文件将替换并备份，账号和用户文件保留。请先暂停其他客户端的传输。`))return;setUpdateBusy(true);$('update-result').textContent='正在下载、校验并安装更新，请保持页面打开…';try{const result=await api('update-install',{version:updateVersion});$('update-result').textContent=`已更新到 ${result.version}，正在刷新页面…`;location.reload();}catch(e){$('update-result').textContent=e.message+'；如连接中断，请刷新页面检查当前版本';setUpdateBusy(false);}};
 $('password-form').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget;try{await api('password',Object.fromEntries(new FormData(form)));form.reset();$('password-result').textContent='密码已修改，其他网页登录会话已失效';}catch(e){$('password-result').textContent=e.message;}};
 load();
 </script>
