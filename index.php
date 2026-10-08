@@ -7,10 +7,11 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.5';
+const QINDAV_VERSION = '1.4.6';
 const PERFORMANCE_LOG_ENABLED = true;
 const PERFORMANCE_LOG_MAX_BYTES = 2 * 1024 * 1024;
-performanceStart();
+// Keep only baseline timestamps until the existing configuration read decides whether to log.
+$performanceEntryStarted = PERFORMANCE_LOG_ENABLED ? hrtime(true) : 0;
 try { $applicationLock = applicationGate(); } catch (Throwable $error) {
     error_log('QinDav bootstrap: ' . $error->getMessage());
     http_response_code(503);
@@ -21,7 +22,6 @@ if (!is_file(__DIR__ . '/vendor/autoload.php')) {
     exit('请先运行 composer install --no-dev --optimize-autoloader');
 }
 require __DIR__ . '/vendor/autoload.php';
-if (isset($GLOBALS['qinPerf'])) performanceTock('bootstrap', $GLOBALS['qinPerf']['_started']);
 
 use Sabre\DAV;
 use Sabre\HTTP\RequestInterface;
@@ -32,7 +32,7 @@ const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'];
 const BROWSER_CHUNK_BYTES = 16 * 1024 * 1024;
 const UPLOAD_TTL = 86400;
 
-// Temporary server-side diagnostics. Set PERFORMANCE_LOG_ENABLED to false to stop recording.
+// Diagnostics are opt-in in settings. PERFORMANCE_LOG_ENABLED is a hard override.
 // Timings begin when this PHP entry executes; upstream buffering and client cache time are outside this scope.
 function performanceTick(): int
 {
@@ -57,6 +57,7 @@ function performanceCount(string $key): void
 
 function performanceMeasure(string $phase, callable $work): mixed
 {
+    if (!isset($GLOBALS['qinPerf'])) return $work();
     $started = performanceTick();
     try { return $work(); }
     catch (Throwable $error) {
@@ -141,18 +142,26 @@ function performanceCopy(mixed $input, mixed $output, ?int $maximum): int
     }
 }
 
-function performanceStart(): void
+function performanceEnabled(array $cfg): bool
 {
-    if (!PERFORMANCE_LOG_ENABLED) return;
+    return PERFORMANCE_LOG_ENABLED && !empty($cfg['performance_log_enabled']);
+}
+
+function performanceStart(array $cfg, int $entryStarted, int $configStarted): void
+{
+    if (!performanceEnabled($cfg)) return;
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     if (!str_starts_with($path, '/index.php/')) return;
     try {
+        $configFinished = hrtime(true);
+        $startedUnix = microtime(true) - ($configFinished - $entryStarted) / 1e9;
         $usage = function_exists('getrusage') ? (getrusage() ?: []) : [];
         $protocol = $_SERVER['SERVER_PROTOCOL'] ?? '';
         $expect = strtolower(trim($_SERVER['HTTP_EXPECT'] ?? ''));
         $GLOBALS['qinPerf'] = [
-            '_started' => hrtime(true), '_cpu_started' => performanceCpu(), '_usage_started' => $usage,
-            'schema' => 1, 'request_id' => bin2hex(random_bytes(6)), 'started_unix' => microtime(true),
+            '_started' => $entryStarted, '_cpu_started' => performanceCpu(), '_usage_started' => $usage,
+            'cpu_scope' => 'after-config',
+            'schema' => 1, 'request_id' => bin2hex(random_bytes(6)), 'started_unix' => $startedUnix,
             'method' => substr((string) ($_SERVER['REQUEST_METHOD'] ?? ''), 0, 20),
             'pid' => getmypid(), 'app_version' => QINDAV_VERSION, 'php_version' => PHP_VERSION, 'php_sapi' => PHP_SAPI,
             'opcache_enabled' => filter_var(ini_get('opcache.enable'), FILTER_VALIDATE_BOOLEAN)
@@ -164,7 +173,9 @@ function performanceStart(): void
             'expect_mode' => $expect === '' ? 'none' : ($expect === '100-continue' ? '100-continue' : 'other'),
             'transfer_chunked_visible' => stripos($_SERVER['HTTP_TRANSFER_ENCODING'] ?? '', 'chunked') !== false,
             'client' => preg_match('/^rclone\/(v?[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[0-9A-Za-z.]+)?)/', $_SERVER['HTTP_USER_AGENT'] ?? '', $match) ? 'rclone/' . substr($match[1], 0, 64) : 'other',
-            'copied_bytes' => 0, 'published_bytes' => 0, 'ledger_write_count' => 0, 'storage_lock_count' => 0, 'phase_ms' => [],
+            'copied_bytes' => 0, 'published_bytes' => 0, 'ledger_write_count' => 0, 'storage_lock_count' => 0,
+            'phase_ms' => ['bootstrap' => ($configStarted - $entryStarted) / 1e6,
+                'config' => ($configFinished - $configStarted) / 1e6],
         ];
         register_shutdown_function('performanceFinish');
     } catch (Throwable $ignored) { unset($GLOBALS['qinPerf']); }
@@ -306,6 +317,7 @@ function performanceSummary(string $snapshot): string
         $cpu = array_sum(array_column($operations, 'php_cpu_ms')) / count($operations);
         $peak = max(array_column($operations, 'peak_memory_bytes') ?: [0]) / 1048576;
         $lines[] = sprintf('上传/COPY：PHP 总耗时均值 %.3f ms，P95 %.3f ms，CPU 均值 %.3f ms，峰值内存 %.1f MiB', array_sum($walls) / count($walls), $p95, $cpu, $peak);
+        if (($latest['cpu_scope'] ?? '') === 'after-config') $lines[] = 'CPU 和上下文切换从配置读取后开始统计；PHP 总耗时仍含入口启动与配置读取。';
         $scheduled = array_values(array_filter($operations, fn($row) => isset($row['voluntary_context_switches'], $row['involuntary_context_switches'])));
         if ($scheduled) $lines[] = sprintf('进程上下文切换（%d 请求）：主动均值 %.1f 次，被动均值 %.1f 次 / 最大 %d 次；计数不能直接判定原因',
             count($scheduled), array_sum(array_column($scheduled, 'voluntary_context_switches')) / count($scheduled),
@@ -365,6 +377,7 @@ function performanceSummary(string $snapshot): string
             $row['io_read_ge100ms_count'] ?? 0, $row['io_read_max_ms'] ?? 0, ($row['io_worst_read_offset_bytes'] ?? 0) / 1048576);
     }
     $lines[] = ''; $lines[] = '范围：仅 PHP 执行阶段，复制耗时包含读取等待与写入；不含客户端缓存和 PHP 执行前的上游等待。';
+    $lines[] = '日志追加在上述计时后执行，不包含在 PHP 总耗时中；日志锁等待不代表完整日志写入开销。';
     $lines[] = '平均速度包含窗口内空闲时间，建议每轮上传前清空日志。';
     if ($uploads) $lines[] = '协议与请求头仅反映 PHP 可见值，上游可能已转换；读取耗时也可能包含进程调度，不能单凭这些计数定位网络或前置服务。';
     return implode("\n", $lines) . "\n";
@@ -1790,13 +1803,18 @@ function handleApi(array $cfg, string $action): never
         jsonResponse(['ok' => true]);
     }
     if ($action === 'performance-settings') {
-        $enabled = $body['split_io'] ?? null;
-        if (!is_bool($enabled)) throw new InvalidArgumentException('诊断设置无效');
-        transaction(stateDir() . '/config.json', function (&$current) use ($enabled, $sessionEpoch) {
+        if (!array_key_exists('enabled', $body) && !array_key_exists('split_io', $body)) throw new InvalidArgumentException('诊断设置无效');
+        foreach (['enabled', 'split_io'] as $key) {
+            if (array_key_exists($key, $body) && !is_bool($body[$key])) throw new InvalidArgumentException('诊断设置无效');
+        }
+        $settings = transaction(stateDir() . '/config.json', function (&$current) use ($body, $sessionEpoch) {
             if (!hash_equals($current['session_epoch'], $sessionEpoch)) throw new DAV\Exception\Forbidden('Session expired');
-            $current['performance_split_io'] = $enabled;
+            if (array_key_exists('enabled', $body)) $current['performance_log_enabled'] = $body['enabled'];
+            if (array_key_exists('split_io', $body)) $current['performance_split_io'] = $body['split_io'];
+            if (!performanceEnabled($current)) $current['performance_split_io'] = false;
+            return ['enabled' => performanceEnabled($current), 'split_io' => !empty($current['performance_split_io'])];
         });
-        jsonResponse(['ok' => true, 'split_io' => $enabled]);
+        jsonResponse(['ok' => true] + $settings);
     }
     if ($action === 'update-info') jsonResponse(updateCapabilities() + updateBackups());
     if ($action === 'update-backup-limit') {
@@ -1878,7 +1896,9 @@ function handleApi(array $cfg, string $action): never
 function html(string $value): string { return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 
 try {
-    $cfg = performanceMeasure('config', fn() => config());
+    $performanceConfigStarted = PERFORMANCE_LOG_ENABLED ? hrtime(true) : 0;
+    $cfg = config();
+    performanceStart($cfg, $performanceEntryStarted, $performanceConfigStarted);
     performanceSet('split_io_enabled', !empty($cfg['performance_split_io']));
     $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     $davBase = '/index.php/';
@@ -1994,7 +2014,7 @@ body.app{height:100dvh;overflow:hidden}.app main{max-width:none;width:100%;heigh
 <div class="table-wrap" id="file-list" aria-busy="true"><table><thead><tr><th scope="col"><button id="sort-name">名称 ↑</button></th><th scope="col"><button id="sort-size">大小</button></th><th scope="col" class="modified"><button id="sort-modified">修改时间</button></th><th scope="col" class="actions">操作</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="loading-cell">正在读取文件…</td></tr></tbody></table></div>
 <div class="pager"><span class="info" id="capacity"></span><div><button id="prev">上一页</button><button id="next">下一页</button></div></div>
 </section>
-<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="performance-title"><h3 id="performance-title">性能日志</h3><p class="info">记录上传、复制、异常和超过 100 ms 的请求。每轮上传前清空，完成后复制摘要用于分析。</p><label class="performance-toggle"><input id="performance-split" type="checkbox"<?= !empty($cfg['performance_split_io']) ? ' checked' : '' ?>> 开启读写分段诊断</label><p class="info">仅用于一轮诊断，完成后关闭。记录读写耗时、首块等待和约 1 MiB 窗口速度；使用 8 KiB 分段计时，可能影响速度。关闭时使用原生流复制。</p><div class="tools"><button id="performance-view" type="button">查看摘要</button><button id="performance-copy" type="button">复制摘要</button><button id="performance-clear" type="button">清空日志</button></div><textarea id="performance-output" class="performance-output" rows="10" readonly spellcheck="false" aria-label="性能日志摘要" hidden></textarea><div class="status" id="performance-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
+<dialog class="settings" id="settings" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">连接与账号设置</h2><button class="quiet" id="settings-close" type="button" aria-label="关闭设置" autofocus>关闭</button></div><div class="settings-content"><div class="connection"><div><span class="info">WEBDAV 连接地址</span><p><code id="endpoint"></code></p><span class="info">用户名：<?= html($cfg['username']) ?> · rclone 类型：other</span></div><button id="copy-url">复制地址</button></div><section class="storage-panel" aria-labelledby="storage-title"><h3 id="storage-title">存储空间</h3><div class="storage-summary"><span><strong class="storage-used" id="storage-used">—</strong> 已用</span><span class="info" id="storage-details"></span></div><meter class="storage-meter" id="storage-meter" min="0" max="1" value="0" aria-label="容量使用比例"></meter><p class="info" id="storage-remaining"></p><form id="quota-form"><div class="quota-row"><label><span class="label">容量上限 · 0 表示不限</span><input id="quota-limit" type="number" min="0" step="any" value="0" required></label><select id="quota-unit" aria-label="容量单位"><option value="1073741824">GiB</option><option value="1099511627776">TiB</option><option value="1048576">MiB</option></select><button class="primary" id="quota-save">保存上限</button></div></form><div class="storage-actions"><span class="info">上传会预留空间，删除后释放用量。</span><button id="storage-rescan" type="button">重新统计</button></div><div class="status" id="storage-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="update-title"><h3 id="update-title">程序更新</h3><p class="info">当前版本 <span id="update-current"><?= html(QINDAV_VERSION) ?></span> · 更新保留账号、设置与用户文件。</p><div class="tools"><button id="update-check" type="button">检查更新</button><button id="update-install" type="button" class="primary" disabled>立即更新</button></div><form id="backup-form"><div class="quota-row"><label><span class="label">备份保留份数 · 1–10</span><input id="backup-keep" type="number" min="1" max="10" step="1" value="2" required></label><button id="backup-save" type="submit">保存份数</button></div></form><div id="update-backups"></div><div class="status" id="update-result" role="status" aria-live="polite"></div></section><section class="storage-panel" aria-labelledby="performance-title"><h3 id="performance-title">性能日志</h3><p class="info">记录上传、复制、异常和超过 100 ms 的请求。每轮上传前清空，完成后复制摘要用于分析。</p><label class="performance-toggle"><input id="performance-enabled" type="checkbox"<?= performanceEnabled($cfg) ? ' checked' : '' ?><?= !PERFORMANCE_LOG_ENABLED ? ' disabled' : '' ?>> 开启性能日志</label><p class="info">默认关闭。关闭后停止性能计时与日志写入，并使用原生复制；已有日志仍可查看、复制或清空。</p><label class="performance-toggle"><input id="performance-split" type="checkbox"<?= performanceEnabled($cfg) && !empty($cfg['performance_split_io']) ? ' checked' : '' ?><?= !performanceEnabled($cfg) ? ' disabled' : '' ?>> 开启读写分段诊断</label><p class="info">仅用于一轮诊断，完成后关闭。记录读写耗时、首块等待和约 1 MiB 窗口速度；使用 8 KiB 分段计时，可能影响速度。关闭时使用原生流复制。</p><div class="tools"><button id="performance-view" type="button">查看摘要</button><button id="performance-copy" type="button">复制摘要</button><button id="performance-clear" type="button">清空日志</button></div><textarea id="performance-output" class="performance-output" rows="10" readonly spellcheck="false" aria-label="性能日志摘要" hidden></textarea><div class="status" id="performance-result" role="status" aria-live="polite"></div></section><p class="info">应用密码用于 WebDAV 客户端，创建新密码会替换旧密码。可随时查看或复制。</p><div class="tools"><button id="view-app">查看应用密码</button><button id="copy-app">复制应用密码</button><button id="app-password">生成应用密码</button><button id="revoke-app">撤销应用密码</button></div><input id="app-secret" type="text" aria-label="应用密码" readonly autocomplete="off" spellcheck="false" hidden><div class="status" id="app-result" role="status" aria-live="polite"></div><form id="password-form"><div class="password-grid"><label><span class="label">当前密码</span><input name="current" type="password" autocomplete="current-password" required></label><label><span class="label">新密码 · 至少 12 字节</span><input name="password" type="password" autocomplete="new-password" required></label><button>修改密码</button></div><div class="status" id="password-result" role="status"></div></form></div></dialog>
 <dialog id="action-dialog" class="action-dialog" aria-labelledby="action-title" aria-describedby="action-message"><form id="action-form"><div class="action-symbol" id="action-symbol" aria-hidden="true">!</div><h2 id="action-title"></h2><p id="action-message"></p><label id="action-input-label" hidden><span class="label" id="action-label"></span><input id="action-input" autocomplete="off" spellcheck="false"></label><div class="action-controls"><button type="button" id="action-cancel">取消</button><button type="submit" id="action-submit" class="primary">确认</button></div></form></dialog>
 <script nonce="<?= html($nonce) ?>">
 'use strict';
@@ -2124,7 +2144,11 @@ $('settings-close').onclick=closeSettings;
 settings.addEventListener('cancel',hideAppPassword);
 settings.addEventListener('close',()=>{hideAppPassword();$('app-result').textContent='';document.body.classList.remove('modal-open');$('settings-button').setAttribute('aria-expanded','false');});
 settings.addEventListener('click',event=>{const rect=settings.getBoundingClientRect();if(event.target===settings&&(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom))closeSettings();});
-$('performance-split').onchange=async()=>{const toggle=$('performance-split'),enabled=toggle.checked;toggle.disabled=true;try{await api('performance-settings',{split_io:enabled});$('performance-result').textContent=enabled?'分段诊断已开启，请清空日志后开始上传':'分段诊断已关闭，后续上传使用原生流复制';}catch(e){toggle.checked=!enabled;$('performance-result').textContent=e.message;}finally{toggle.disabled=false;}};
+let performanceSettings={enabled:<?= performanceEnabled($cfg) ? 'true' : 'false' ?>,split_io:<?= performanceEnabled($cfg) && !empty($cfg['performance_split_io']) ? 'true' : 'false' ?>};
+function renderPerformanceSettings(){$('performance-enabled').checked=performanceSettings.enabled;$('performance-enabled').disabled=<?= PERFORMANCE_LOG_ENABLED ? 'false' : 'true' ?>;$('performance-split').checked=performanceSettings.split_io;$('performance-split').disabled=!performanceSettings.enabled;}
+async function savePerformanceSettings(change){$('performance-enabled').disabled=$('performance-split').disabled=true;try{performanceSettings=await api('performance-settings',change);$('performance-result').textContent=!performanceSettings.enabled?'性能日志已关闭，后续请求不再记录，上传使用原生复制':performanceSettings.split_io?'性能日志及分段诊断已开启，请清空日志后开始上传':'性能日志已开启，上传使用原生复制';}catch(e){$('performance-result').textContent=e.message;}finally{renderPerformanceSettings();}}
+$('performance-enabled').onchange=()=>savePerformanceSettings({enabled:$('performance-enabled').checked});
+$('performance-split').onchange=()=>savePerformanceSettings({split_io:$('performance-split').checked});
 async function readPerformance(){const response=await fetch('/?api=performance-log',{credentials:'same-origin',cache:'no-store'});if(!response.ok)throw Error('读取日志失败，请检查登录状态');return response.text();}
 function setPerformanceBusy(busy){for(const id of ['performance-view','performance-copy','performance-clear'])$(id).disabled=busy;}
 $('performance-view').onclick=async()=>{const output=$('performance-output');if(!output.hidden){output.hidden=true;$('performance-view').textContent='查看摘要';return;}setPerformanceBusy(true);$('performance-result').textContent='正在整理摘要…';try{output.value=await readPerformance();output.hidden=false;$('performance-view').textContent='收起摘要';$('performance-result').textContent='';}catch(e){$('performance-result').textContent=e.message;}finally{setPerformanceBusy(false);}};
