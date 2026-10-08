@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
            'PHP_CLI_SERVER_WORKERS': '4'}
     env.pop('WEBDAV_SETUP_TOKEN', None); env.pop('WEBDAV_ACCEL_PREFIX', None)
     with (tmp / 'server.log').open('w+') as log:
-        process = subprocess.Popen(['php', '-d', 'memory_limit=128M', '-S', f'127.0.0.1:{port}', 'tools/router.php'],
+        process = subprocess.Popen(['php', '-d', 'memory_limit=128M', '-d', 'opcache.enable_cli=0', '-S', f'127.0.0.1:{port}', 'tools/router.php'],
                                    cwd=app, env=env, stdout=log, stderr=log, start_new_session=True)
         try:
             base = f'http://127.0.0.1:{port}'
@@ -130,6 +130,7 @@ with tempfile.TemporaryDirectory(prefix='qindav-update-') as tmp:
             fixture('1.2.0', invalid_version=True)
             check(c.api('update-install', {'version': '1.2.0'})[0] == 400, 'archive version mismatch rejected')
             check(c.api('update-info')[1]['current'] == '1.1.0', 'validation failures preserve old code')
+            # Direct fixture edits bypass the updater's OPcache invalidation; this server disables CLI OPcache.
             # Inject a publication failure in the disposable copy, after vendor replacement.
             before_fault = (app / 'index.php').read_text()
             broken = before_fault.replace("if (!rename($job . '/new/' . $name, $live))", "if ($name === 'dav.php' || !rename($job . '/new/' . $name, $live))")
