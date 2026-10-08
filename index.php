@@ -7,7 +7,10 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 ini_set('zlib.output_compression', '0');
 umask(0077);
-const QINDAV_VERSION = '1.4.1';
+const QINDAV_VERSION = '1.4.2';
+const PERFORMANCE_LOG_ENABLED = true;
+const PERFORMANCE_LOG_MAX_BYTES = 2 * 1024 * 1024;
+performanceStart();
 try { $applicationLock = applicationGate(); } catch (Throwable $error) {
     error_log('QinDav bootstrap: ' . $error->getMessage());
     http_response_code(503);
@@ -18,6 +21,7 @@ if (!is_file(__DIR__ . '/vendor/autoload.php')) {
     exit('请先运行 composer install --no-dev --optimize-autoloader');
 }
 require __DIR__ . '/vendor/autoload.php';
+if (isset($GLOBALS['qinPerf'])) performanceTock('bootstrap', $GLOBALS['qinPerf']['_started']);
 
 use Sabre\DAV;
 use Sabre\HTTP\RequestInterface;
@@ -27,6 +31,124 @@ const UPLOAD_PREFIX = '.dav-upload-';
 const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'];
 const BROWSER_CHUNK_BYTES = 16 * 1024 * 1024;
 const UPLOAD_TTL = 86400;
+
+// Temporary server-side diagnostics. Set PERFORMANCE_LOG_ENABLED to false to stop recording.
+// Timings begin when this PHP entry executes; upstream buffering and client cache time are outside this scope.
+function performanceTick(): int
+{
+    return isset($GLOBALS['qinPerf']) ? hrtime(true) : 0;
+}
+
+function performanceTock(string $phase, int $started): void
+{
+    if ($started === 0 || !isset($GLOBALS['qinPerf'])) return;
+    $GLOBALS['qinPerf']['phase_ms'][$phase] = ($GLOBALS['qinPerf']['phase_ms'][$phase] ?? 0) + (hrtime(true) - $started) / 1e6;
+}
+
+function performanceSet(string $key, mixed $value): void
+{
+    if (isset($GLOBALS['qinPerf'])) $GLOBALS['qinPerf'][$key] = $value;
+}
+
+function performanceCount(string $key): void
+{
+    if (isset($GLOBALS['qinPerf'])) $GLOBALS['qinPerf'][$key] = ($GLOBALS['qinPerf'][$key] ?? 0) + 1;
+}
+
+function performanceMeasure(string $phase, callable $work): mixed
+{
+    $started = performanceTick();
+    try { return $work(); }
+    catch (Throwable $error) {
+        performanceSet('error_class', get_class($error));
+        if (!isset($GLOBALS['qinPerf']['error_phase'])) performanceSet('error_phase', $phase);
+        throw $error;
+    } finally { performanceTock($phase, $started); }
+}
+
+function performanceCpu(): float
+{
+    if (!function_exists('getrusage')) return 0;
+    $usage = getrusage();
+    return ($usage['ru_utime.tv_sec'] ?? 0) * 1000 + ($usage['ru_utime.tv_usec'] ?? 0) / 1000
+        + ($usage['ru_stime.tv_sec'] ?? 0) * 1000 + ($usage['ru_stime.tv_usec'] ?? 0) / 1000;
+}
+
+function performanceStart(): void
+{
+    if (!PERFORMANCE_LOG_ENABLED) return;
+    $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+    if (!str_starts_with($path, '/index.php/')) return;
+    try {
+        $GLOBALS['qinPerf'] = [
+            '_started' => hrtime(true), '_cpu_started' => performanceCpu(),
+            'schema' => 1, 'request_id' => bin2hex(random_bytes(6)), 'started_unix' => microtime(true),
+            'method' => substr((string) ($_SERVER['REQUEST_METHOD'] ?? ''), 0, 20),
+            'pid' => getmypid(), 'app_version' => QINDAV_VERSION, 'php_version' => PHP_VERSION, 'php_sapi' => PHP_SAPI,
+            'opcache_enabled' => filter_var(ini_get('opcache.enable'), FILTER_VALIDATE_BOOLEAN)
+                && (PHP_SAPI !== 'cli' || filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN)),
+            'body_expected_bytes' => isset($_SERVER['CONTENT_LENGTH']) ? max(0, (int) $_SERVER['CONTENT_LENGTH']) : null,
+            'body_mode' => isset($_SERVER['CONTENT_LENGTH']) ? 'content-length'
+                : (stripos($_SERVER['HTTP_TRANSFER_ENCODING'] ?? '', 'chunked') !== false ? 'chunked' : 'unknown'),
+            'client' => preg_match('/^rclone\/(v?[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[0-9A-Za-z.]+)?)/', $_SERVER['HTTP_USER_AGENT'] ?? '', $match) ? 'rclone/' . substr($match[1], 0, 64) : 'other',
+            'copied_bytes' => 0, 'published_bytes' => 0, 'ledger_write_count' => 0, 'storage_lock_count' => 0, 'phase_ms' => [],
+        ];
+        register_shutdown_function('performanceFinish');
+    } catch (Throwable $ignored) { unset($GLOBALS['qinPerf']); }
+}
+
+function performanceFinish(): void
+{
+    if (!isset($GLOBALS['qinPerf'])) return;
+    $record = $GLOBALS['qinPerf'];
+    unset($GLOBALS['qinPerf']); // Diagnostic I/O must not count itself as application work.
+    $record['finished_unix'] = microtime(true);
+    $record['php_wall_ms'] = round((hrtime(true) - $record['_started']) / 1e6, 3);
+    $record['php_cpu_ms'] = round(max(0, performanceCpu() - $record['_cpu_started']), 3);
+    $record['peak_memory_bytes'] = memory_get_peak_usage(true);
+    $record['status'] = http_response_code() ?: 200;
+    $fatal = error_get_last();
+    if ($fatal && in_array($fatal['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+        $record['fatal_error_type'] = $fatal['type'];
+    }
+    foreach ($record['phase_ms'] as &$ms) $ms = round($ms, 3);
+    unset($ms, $record['_started'], $record['_cpu_started']);
+    $topLevel = ['bootstrap', 'config', 'authentication', 'file_open', 'quota_reserve', 'copy_io', 'validate_flush', 'publish', 'cleanup'];
+    $classified = 0;
+    foreach ($topLevel as $phase) $classified += $record['phase_ms'][$phase] ?? 0;
+    $record['php_other_ms'] = round(max(0, $record['php_wall_ms'] - $classified), 3);
+    $record['copy_io_mib_s'] = ($record['phase_ms']['copy_io'] ?? 0) > 0
+        ? round($record['copied_bytes'] / 1048576 / ($record['phase_ms']['copy_io'] / 1000), 3) : null;
+    $lock = $output = null;
+    try {
+        $root = stateDir();
+        $waiting = hrtime(true);
+        $lock = fopen($root . '/performance.log.lock', 'c');
+        if ($lock === false || !flock($lock, LOCK_EX)) throw new RuntimeException('Cannot lock diagnostic log');
+        $record['log_lock_wait_ms'] = round((hrtime(true) - $waiting) / 1e6, 3);
+        $line = json_encode($record, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR) . "\n";
+        $path = $root . '/performance.ndjson';
+        $previous = $root . '/performance.previous.ndjson';
+        if (is_link($path) || is_link($previous)) throw new RuntimeException('Invalid diagnostic log path');
+        clearstatcache(true, $path);
+        if (is_file($path) && filesize($path) + strlen($line) > PERFORMANCE_LOG_MAX_BYTES) {
+            if (!rename($path, $previous)) throw new RuntimeException('Cannot rotate diagnostic log');
+        }
+        $output = fopen($path, 'ab');
+        if ($output === false) throw new RuntimeException('Cannot append diagnostic log');
+        $length = strlen($line); $written = 0;
+        while ($written < $length) {
+            $bytes = fwrite($output, substr($line, $written));
+            if ($bytes === false || $bytes === 0) throw new RuntimeException('Cannot write diagnostic log');
+            $written += $bytes;
+        }
+    } catch (Throwable $ignored) {
+        error_log('QinDav performance: diagnostic log unavailable');
+    } finally {
+        if (is_resource($output)) fclose($output);
+        if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
+    }
+}
 
 function stateDir(): string
 {
@@ -61,6 +183,8 @@ function readJson(string $path): array
 
 function atomicJson(string $path, array $data): void
 {
+    $ledger = isset($GLOBALS['qinPerf']) && basename($path) === 'usage.json';
+    $started = $ledger ? performanceTick() : 0;
     $tmp = tempnam(dirname($path), '.state-');
     if ($tmp === false) throw new RuntimeException('Cannot allocate state file');
     try {
@@ -68,8 +192,10 @@ function atomicJson(string $path, array $data): void
         if (file_put_contents($tmp, $json) !== strlen($json) || !rename($tmp, $path)) {
             throw new RuntimeException('Cannot save state');
         }
+        if ($ledger) performanceCount('ledger_write_count');
     } finally {
         if (is_file($tmp)) unlink($tmp);
+        if ($ledger) performanceTock('ledger_write', $started);
     }
 }
 
@@ -144,7 +270,8 @@ function credentialsValid(array $cfg, string $username, string $password, bool $
         . "\0" . ($allowApp ? ($cfg['app_hash'] ?? '') : 'web-login'), $cfg['secret']);
     $path = stateDir() . '/auth/' . $key . '.json';
     $cached = readJson($path);
-    if (($cached['expires'] ?? 0) > time()) return true;
+    if (($cached['expires'] ?? 0) > time()) { performanceSet('auth_cache', 'hit'); return true; }
+    performanceSet('auth_cache', 'miss');
     if (rateLimited()) return false;
     $valid = hash_equals($cfg['username'], $username) && (
         password_verify($password, $cfg['password_hash']) ||
@@ -195,13 +322,20 @@ function storageTransaction(callable $callback): mixed
 {
     $path = stateDir() . '/usage.json';
     $lock = fopen($path . '.lock', 'c');
-    if ($lock === false || !flock($lock, LOCK_EX)) throw new RuntimeException('Cannot lock storage accounting');
+    $waiting = performanceTick();
+    if ($lock === false || !flock($lock, LOCK_EX)) {
+        performanceTock('storage_lock_wait', $waiting);
+        throw new RuntimeException('Cannot lock storage accounting');
+    }
+    performanceTock('storage_lock_wait', $waiting);
+    performanceCount('storage_lock_count');
+    $holding = performanceTick();
     try {
         clearstatcache();
-        $usage = readJson($path);
+        $usage = performanceMeasure('ledger_read', fn() => readJson($path));
         if (!$usage || !empty($usage['dirty'])) {
             set_time_limit(0);
-            $usage = array_replace(['limit_bytes' => 0, 'reservations' => []], $usage, scanStorage(), ['dirty' => false]);
+            $usage = array_replace(['limit_bytes' => 0, 'reservations' => []], $usage, performanceMeasure('usage_scan', fn() => scanStorage()), ['dirty' => false]);
             atomicJson($path, $usage);
         }
         foreach ($usage['reservations'] as $id => $reservation) {
@@ -213,12 +347,13 @@ function storageTransaction(callable $callback): mixed
             return $result;
         } catch (Throwable $error) {
             if (!empty($usage['dirty'])) {
-                $usage = array_replace($usage, scanStorage(), ['dirty' => false]);
+                $usage = array_replace($usage, performanceMeasure('usage_scan', fn() => scanStorage()), ['dirty' => false]);
                 atomicJson($path, $usage);
             }
             throw $error;
         }
     } finally {
+        performanceTock('storage_lock_hold', $holding);
         flock($lock, LOCK_UN);
         fclose($lock);
     }
@@ -332,7 +467,7 @@ function writeStream(string $destination, mixed $data, bool $createOnly = false)
     $createOnly = $createOnly || (($_SERVER['REQUEST_METHOD'] ?? '') === 'PUT' && trim($_SERVER['HTTP_IF_NONE_MATCH'] ?? '') === '*');
     // Stage beside the destination: same filesystem, atomic rename, no second full-file copy.
     $tmp = dirname($destination) . '/' . UPLOAD_PREFIX . bin2hex(random_bytes(16));
-    $output = fopen($tmp, 'xb');
+    $output = performanceMeasure('file_open', fn() => fopen($tmp, 'xb'));
     if ($output === false) throw new DAV\Exception\InsufficientStorage('Cannot create upload');
     $id = basename($tmp);
     $reserved = false;
@@ -344,32 +479,43 @@ function writeStream(string $destination, mixed $data, bool $createOnly = false)
             $stat = fstat($data);
             if ($stat !== false) $expected = max(0, $stat['size'] - ftell($data));
         }
-        $maximum = reserveStorage($id, $expected, $destination);
+        performanceSet('upload_expected_bytes', $expected);
+        performanceSet('input_stream_type', is_resource($data) ? (stream_get_meta_data($data)['stream_type'] ?? 'unknown') : 'string');
+        $maximum = performanceMeasure('quota_reserve', fn() => reserveStorage($id, $expected, $destination));
         $reserved = true;
-        $bytes = is_resource($data)
+        $bytes = performanceMeasure('copy_io', fn() => is_resource($data)
             ? ($maximum === null ? stream_copy_to_stream($data, $output) : stream_copy_to_stream($data, $output, $maximum + 1))
-            : fwrite($output, (string) $data);
-        if ($maximum !== null && $bytes > $maximum) throw new DAV\Exception\InsufficientStorage('容量上限不足');
-        if ($bytes === false || !fflush($output)) throw new DAV\Exception\InsufficientStorage('Upload write failed');
-        if (is_resource($data) && !feof($data)) throw new DAV\Exception\BadRequest('Incomplete upload');
-        if (($_SERVER['REQUEST_METHOD'] ?? '') === 'PUT' && isset($_SERVER['CONTENT_LENGTH'])
-            && $bytes !== (int) $_SERVER['CONTENT_LENGTH']) throw new DAV\Exception\BadRequest('Incomplete upload');
+            : fwrite($output, (string) $data));
+        performanceSet('copied_bytes', $bytes === false ? 0 : $bytes);
+        performanceMeasure('validate_flush', function () use ($maximum, $bytes, $output, $data) {
+            if ($maximum !== null && $bytes > $maximum) throw new DAV\Exception\InsufficientStorage('容量上限不足');
+            if ($bytes === false || !fflush($output)) throw new DAV\Exception\InsufficientStorage('Upload write failed');
+            if (is_resource($data) && !feof($data)) throw new DAV\Exception\BadRequest('Incomplete upload');
+            if (($_SERVER['REQUEST_METHOD'] ?? '') === 'PUT' && isset($_SERVER['CONTENT_LENGTH'])
+                && $bytes !== (int) $_SERVER['CONTENT_LENGTH']) throw new DAV\Exception\BadRequest('Incomplete upload');
+        });
         fclose($output);
         $output = null;
-        publishStorage($id, $destination, $bytes, function () use ($tmp, $destination, $createOnly) {
+        performanceMeasure('publish', fn() => publishStorage($id, $destination, $bytes, function () use ($tmp, $destination, $createOnly) {
             if (is_link($destination) || is_dir($destination)) throw new DAV\Exception\Forbidden('Invalid destination');
             // Every application publication shares the accounting lock, including create-only PUT/COPY.
             if ($createOnly && file_exists($destination)) throw new DAV\Exception\PreconditionFailed('Destination already exists');
-            if (!rename($tmp, $destination)) throw new DAV\Exception\InsufficientStorage('Cannot commit upload');
-        });
+            performanceMeasure('file_rename', function () use ($tmp, $destination) {
+                if (!rename($tmp, $destination)) throw new DAV\Exception\InsufficientStorage('Cannot commit upload');
+            });
+        }));
+        performanceSet('published_bytes', $bytes);
         // Publication already removes the reservation in the same accounting transaction.
         $reserved = false;
         clearstatcache(true, $destination);
         return (new FastFile($destination))->getETag();
     } finally {
-        if (is_resource($output)) fclose($output);
-        if (is_file($tmp)) unlink($tmp);
-        if ($reserved) releaseStorage($id);
+        $cleanup = performanceTick();
+        try {
+            if (is_resource($output)) fclose($output);
+            if (is_file($tmp)) unlink($tmp);
+            if ($reserved) releaseStorage($id);
+        } finally { performanceTock('cleanup', $cleanup); }
     }
 }
 
@@ -576,14 +722,17 @@ final class AppAuth extends DAV\Auth\Backend\AbstractBasic
     }
     public function check(RequestInterface $request, ResponseInterface $response)
     {
-        if ((string) $request->getHeader('Authorization') !== '') return parent::check($request, $response);
-        if (!isset($_COOKIE['single_dav'])) return [false, 'Authentication required'];
-        openSession();
-        $valid = sessionUser($this->cfg);
-        $csrf = in_array($request->getMethod(), SAFE_METHODS, true) || csrfValid((string) $request->getHeader('X-CSRF-Token'));
-        session_write_close(); // Release the lock before streaming or traversing directories.
-        if ($valid && !$csrf) throw new DAV\Exception\Forbidden('CSRF token required');
-        return $valid ? [true, 'principals/' . $this->cfg['username']] : [false, 'Session expired'];
+        $started = performanceTick();
+        try {
+            if ((string) $request->getHeader('Authorization') !== '') return parent::check($request, $response);
+            if (!isset($_COOKIE['single_dav'])) return [false, 'Authentication required'];
+            openSession();
+            $valid = sessionUser($this->cfg);
+            $csrf = in_array($request->getMethod(), SAFE_METHODS, true) || csrfValid((string) $request->getHeader('X-CSRF-Token'));
+            session_write_close(); // Release the lock before streaming or traversing directories.
+            if ($valid && !$csrf) throw new DAV\Exception\Forbidden('CSRF token required');
+            return $valid ? [true, 'principals/' . $this->cfg['username']] : [false, 'Session expired'];
+        } finally { performanceTock('authentication', $started); }
     }
 }
 
@@ -1462,7 +1611,7 @@ function handleApi(array $cfg, string $action): never
 function html(string $value): string { return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 
 try {
-    $cfg = config();
+    $cfg = performanceMeasure('config', fn() => config());
     $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
     $davBase = '/index.php/';
     if (str_starts_with($uri, $davBase)) {
